@@ -1,0 +1,477 @@
+import { create } from 'zustand'
+
+const API_BASE = '/api'
+
+const mockResponses = [
+  'Hello! How can I assist you today?',
+  'That\'s a great question! Let me think about it.',
+  'I understand. Here\'s what I know about that topic.',
+  'Interesting perspective! I can help you with that.',
+  'Thanks for asking. Here\'s my response:',
+]
+
+const generateResponse = () => {
+  return mockResponses[Math.floor(Math.random() * mockResponses.length)]
+}
+
+const formatSignResult = (data) => {
+  if (!data) return '识别完成'
+  
+  let result = `识别时间：${data.time}\n\n`
+  result += `共识别 ${data.total_images} 张图片\n`
+  
+  if (data.total_signs > 0) {
+    result += `\n🚦 交通标志（共 ${data.total_signs} 个）：\n`
+    data.results?.forEach((imageResult, index) => {
+      if (imageResult.traffic_signs && imageResult.traffic_signs.length > 0) {
+        result += `\n图片 ${index + 1}：\n`
+        imageResult.traffic_signs.forEach(sign => {
+          result += `- ${sign.type}：${sign.value || '无'}，置信度 ${sign.confidence}%\n`
+        })
+      }
+    })
+  }
+  
+  if (data.total_lights > 0) {
+    result += `\n🔴 交通信号灯（共 ${data.total_lights} 个）：\n`
+    data.results?.forEach((imageResult, index) => {
+      if (imageResult.traffic_lights && imageResult.traffic_lights.length > 0) {
+        result += `\n图片 ${index + 1}：\n`
+        imageResult.traffic_lights.forEach(light => {
+          const statusText = { red: '红灯', green: '绿灯', yellow: '黄灯' }
+          result += `- 信号灯：${statusText[light.status] || light.status}，置信度 ${light.confidence}%\n`
+        })
+      }
+    })
+  }
+  
+  if (data.total_signs === 0 && data.total_lights === 0) {
+    result += '\n未识别到交通标志和信号灯'
+  }
+  
+  return result
+}
+
+const getToken = () => {
+  return localStorage.getItem('token')
+}
+
+const setToken = (token) => {
+  localStorage.setItem('token', token)
+}
+
+const removeToken = () => {
+  localStorage.removeItem('token')
+}
+
+const request = async (url, options = {}) => {
+  const token = getToken()
+  const headers = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+  }
+  
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  
+  const response = await fetch(`${API_BASE}${url}`, {
+    ...options,
+    headers,
+  })
+  
+  const data = await response.json()
+  
+  if (!response.ok) {
+    throw new Error(data.detail || data.message || '请求失败')
+  }
+  
+  return data
+}
+
+const requestFormData = async (url, options = {}) => {
+  const token = getToken()
+  const headers = {
+    ...options.headers,
+  }
+  
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  
+  const response = await fetch(`${API_BASE}${url}`, {
+    ...options,
+    headers,
+  })
+  
+  const data = await response.json()
+  
+  if (!response.ok) {
+    throw new Error(data.detail || data.message || '请求失败')
+  }
+  
+  return data
+}
+
+export const useStore = create((set, get) => ({
+  user: null,
+  conversations: [
+    {
+      id: '1',
+      title: 'New Conversation',
+      messages: [],
+      createdAt: new Date(),
+    },
+  ],
+  activeConversationId: '1',
+  loading: false,
+  error: null,
+  theme: 'dark',
+
+  setLoading: (loading) => set({ loading }),
+  setError: (error) => set({ error }),
+
+  toggleTheme: () => set((state) => ({
+    theme: state.theme === 'dark' ? 'light' : 'dark',
+  })),
+
+  register: async (username, email, password) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const data = await request('/auth/register', {
+        method: 'POST',
+        body: JSON.stringify({ username, email, password }),
+      })
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  login: async (username, password) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const data = await request('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      })
+      setToken(data.access_token)
+      set({
+        user: {
+          id: data.user.id,
+          name: data.user.username,
+          email: data.user.email,
+          avatar: data.user.avatar,
+          roles: data.user.roles,
+          isLoggedIn: true,
+        },
+      })
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  logout: () => {
+    removeToken()
+    set({ user: null })
+  },
+
+  getCurrentUser: async () => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const data = await request('/auth/me')
+      set({
+        user: {
+          id: data.id,
+          name: data.username,
+          email: data.email,
+          avatar: data.avatar,
+          roles: data.roles,
+          isLoggedIn: true,
+        },
+      })
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      removeToken()
+      set({ user: null })
+      return null
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  forgotPassword: async (email) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const data = await request('/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+      })
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  changePassword: async (oldPassword, newPassword) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const data = await request('/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+      })
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  updateEmail: async (newEmail) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const data = await request('/auth/update-email', {
+        method: 'POST',
+        body: JSON.stringify({ email: newEmail }),
+      })
+      set((state) => ({
+        user: state.user ? { ...state.user, email: data.email } : null,
+      }))
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  uploadAvatar: async (file) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      
+      const data = await requestFormData('/auth/upload-avatar', {
+        method: 'POST',
+        body: formData,
+      })
+      
+      set((state) => ({
+        user: state.user ? { ...state.user, avatar: data.avatar } : null,
+      }))
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  recognizeSigns: async (conversationId, files) => {
+    get().setLoading(true)
+    get().setError(null)
+    try {
+      const formData = new FormData()
+      files.forEach(file => {
+        formData.append('files', file)
+      })
+      
+      const data = await requestFormData('/sign-analyzer/batch', {
+        method: 'POST',
+        body: formData,
+      })
+      
+      const resultContent = formatSignResult(data.data)
+      
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.id === conversationId
+            ? {
+                ...c,
+                title: c.messages.length === 0 ? '交通标志与信号灯识别' : c.title,
+                messages: [
+                  ...c.messages,
+                  {
+                    id: Date.now().toString(),
+                    conversationId,
+                    role: 'user',
+                    content: `识别了 ${data.data?.total_images || files.length} 张图片`,
+                    createdAt: new Date(),
+                  },
+                  {
+                    id: (Date.now() + 1).toString(),
+                    conversationId,
+                    role: 'assistant',
+                    content: resultContent,
+                    createdAt: new Date(),
+                    type: 'text',
+                  },
+                ],
+              }
+            : c
+        ),
+      }))
+      
+      return data
+    } catch (error) {
+      get().setError(error.message)
+      throw error
+    } finally {
+      get().setLoading(false)
+    }
+  },
+
+  addConversation: () => {
+    const newId = Date.now().toString()
+    const newConversation = {
+      id: newId,
+      title: 'New Conversation',
+      messages: [],
+      createdAt: new Date(),
+    }
+    set((state) => ({
+      conversations: [...state.conversations, newConversation],
+      activeConversationId: newId,
+    }))
+    return newId
+  },
+
+  setActiveConversation: (id) => {
+    set({ activeConversationId: id })
+  },
+
+  closeConversation: (id) => {
+    set((state) => {
+      const conversations = state.conversations.filter((c) => c.id !== id)
+      let newActiveId = state.activeConversationId
+      if (state.activeConversationId === id) {
+        newActiveId = conversations.length > 0 ? conversations[0].id : null
+      }
+      return { conversations, activeConversationId: newActiveId }
+    })
+  },
+
+  updateConversationTitle: (conversationId, title) => {
+    set((state) => ({
+      conversations: state.conversations.map((c) =>
+        c.id === conversationId ? { ...c, title } : c
+      ),
+    }))
+  },
+
+  pinConversation: (conversationId) => {
+    set((state) => {
+      const conversations = [...state.conversations]
+      const index = conversations.findIndex((c) => c.id === conversationId)
+      if (index > 0) {
+        const [pinned] = conversations.splice(index, 1)
+        conversations.unshift(pinned)
+      }
+      return { conversations }
+    })
+  },
+
+  sendMessage: (conversationId, content) => {
+    const trimmedContent = content.trim().toLowerCase()
+    
+    if (trimmedContent.includes('标志识别') || trimmedContent.includes('交通标志') || trimmedContent.includes('信号灯')) {
+      const uploadMessage = {
+        id: Date.now().toString(),
+        conversationId,
+        role: 'assistant',
+        content: '',
+        createdAt: new Date(),
+        type: 'sign_upload',
+      }
+
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.id === conversationId
+            ? { 
+                ...c, 
+                messages: [...c.messages, uploadMessage],
+                title: c.messages.length === 0 ? '交通标志与信号灯识别' : c.title
+              }
+            : c
+        ),
+      }))
+      return
+    }
+
+    const userMessage = {
+      id: Date.now().toString(),
+      conversationId,
+      role: 'user',
+      content,
+      createdAt: new Date(),
+    }
+
+    set((state) => ({
+      conversations: state.conversations.map((c) =>
+        c.id === conversationId
+          ? { 
+              ...c, 
+              messages: [...c.messages, userMessage],
+              title: c.messages.length === 0 ? '通用对话' : c.title
+            }
+          : c
+      ),
+    }))
+
+    setTimeout(() => {
+      const assistantMessage = {
+        id: (Date.now() + 1).toString(),
+        conversationId,
+        role: 'assistant',
+        content: generateResponse(),
+        createdAt: new Date(),
+        type: 'text',
+      }
+
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.id === conversationId
+            ? { ...c, messages: [...c.messages, assistantMessage] }
+            : c
+        ),
+      }))
+    }, 1000)
+  },
+
+  updateMessage: (conversationId, messageId, content) => {
+    set((state) => ({
+      conversations: state.conversations.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              messages: c.messages.map((m) =>
+                m.id === messageId ? { ...m, content } : m
+              ),
+            }
+          : c
+      ),
+    }))
+  },
+}))
