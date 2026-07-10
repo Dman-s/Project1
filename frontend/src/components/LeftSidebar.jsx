@@ -2,6 +2,15 @@ import { useState } from 'react'
 import { Bot, MessageSquare, History, ChevronRight, Sparkles, Pin, Trash2 } from 'lucide-react'
 import { useStore } from '../store/useStore'
 
+const formatTime = (date) => {
+  if (!date) return ''
+  const d = new Date(date)
+  const hours = d.getHours().toString().padStart(2, '0')
+  const minutes = d.getMinutes().toString().padStart(2, '0')
+  const seconds = d.getSeconds().toString().padStart(2, '0')
+  return `${hours}:${minutes}:${seconds}`
+}
+
 export function LeftSidebar({ onCreateConversation, style }) {
   const { conversations, activeConversationId, setActiveConversation, closeConversation, pinConversation } = useStore()
   const [hoveredId, setHoveredId] = useState(null)
@@ -31,7 +40,7 @@ export function LeftSidebar({ onCreateConversation, style }) {
 
       <div className="px-4 py-3">
         <button
-          onClick={onCreateConversation}
+          onClick={() => onCreateConversation()}
           className="w-full flex items-center rounded-xl bg-gradient-to-r from-accent-500 to-accent-600 hover:opacity-90 transition-opacity text-white font-medium"
           style={{ 
             gap: `${Math.round(12 * scale)}px`, 
@@ -72,6 +81,9 @@ export function LeftSidebar({ onCreateConversation, style }) {
               >
                 <MessageSquare className="flex-shrink-0" style={{ width: `${Math.round(16 * scale)}px`, height: `${Math.round(16 * scale)}px` }} />
                 <span className="truncate flex-1">{conversation.title}</span>
+                <span className="text-xs text-dark-500 flex-shrink-0" style={{ fontSize: `${Math.round(12 * scale)}px` }}>
+                  {formatTime(conversation.updatedAt || conversation.createdAt)}
+                </span>
                 <ChevronRight className="flex-shrink-0 opacity-0 hover:opacity-100 transition-opacity" style={{ width: `${Math.round(16 * scale)}px`, height: `${Math.round(16 * scale)}px` }} />
               </button>
 

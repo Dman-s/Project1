@@ -35,8 +35,8 @@ export default function Home() {
     }
   }, [])
 
-  const handleCreateConversation = () => {
-    addConversation()
+  const handleCreateConversation = async () => {
+    await addConversation()
   }
 
   const handleSidebarMouseDown = (e) => {

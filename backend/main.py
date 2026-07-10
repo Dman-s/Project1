@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.api.sign_analyzer import router as sign_analyzer_router
+from app.api.chat_session import router as chat_session_router
 from app.config.settings import settings
 from app.core.exceptions import register_exception_handlers
 from app.middleware.request_logger import RequestLogMiddleware
@@ -63,6 +64,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(health_router)
 app.include_router(sign_analyzer_router)
+app.include_router(chat_session_router)
 
 # ── 静态文件服务 ───────────────────────────────────────
 # 用于访问上传的头像文件

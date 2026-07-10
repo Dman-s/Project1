@@ -121,6 +121,7 @@ export const useStore = create((set, get) => ({
       title: 'New Conversation',
       messages: [],
       createdAt: new Date(),
+      persisted: false,
     },
   ],
   activeConversationId: '1',
@@ -171,6 +172,7 @@ export const useStore = create((set, get) => ({
           isLoggedIn: true,
         },
       })
+      await get().loadConversations()
       return data
     } catch (error) {
       get().setError(error.message)
@@ -182,7 +184,19 @@ export const useStore = create((set, get) => ({
 
   logout: () => {
     removeToken()
-    set({ user: null })
+    set({
+      user: null,
+      conversations: [
+        {
+          id: '1',
+          title: 'New Conversation',
+          messages: [],
+          createdAt: new Date(),
+          persisted: false,
+        },
+      ],
+      activeConversationId: '1',
+    })
   },
 
   getCurrentUser: async () => {
@@ -200,6 +214,7 @@ export const useStore = create((set, get) => ({
           isLoggedIn: true,
         },
       })
+      await get().loadConversations()
       return data
     } catch (error) {
       get().setError(error.message)
@@ -208,6 +223,51 @@ export const useStore = create((set, get) => ({
       return null
     } finally {
       get().setLoading(false)
+    }
+  },
+
+  loadConversations: async () => {
+    try {
+      const data = await request('/chat-sessions')
+      if (data.success && data.data) {
+        const conversations = data.data.map(session => ({
+          id: session.id,
+          title: session.title,
+          messages: session.messages || [],
+          createdAt: session.createdAt ? new Date(session.createdAt) : new Date(),
+          updatedAt: session.updatedAt ? new Date(session.updatedAt) : new Date(),
+          persisted: true,
+        }))
+        set((state) => ({
+          conversations: conversations.length > 0 ? conversations : state.conversations,
+          activeConversationId: conversations.length > 0 ? conversations[0].id : state.activeConversationId,
+        }))
+      }
+    } catch (error) {
+      console.error('Failed to load conversations:', error)
+    }
+  },
+
+  saveConversation: async (conversation) => {
+    if (!conversation.persisted) return
+    try {
+      await request(`/chat-sessions/${conversation.id}/title?title=${encodeURIComponent(conversation.title)}`, {
+        method: 'PUT',
+      })
+    } catch (error) {
+      console.error('Failed to save conversation:', error)
+    }
+  },
+
+  saveMessage: async (conversationId, role, content) => {
+    const conv = get().conversations.find(c => c.id === conversationId)
+    if (!conv || !conv.persisted) return
+    try {
+      await request(`/chat-sessions/${conversationId}/messages?role=${encodeURIComponent(role)}&content=${encodeURIComponent(content)}`, {
+        method: 'POST',
+      })
+    } catch (error) {
+      console.error('Failed to save message:', error)
     }
   },
 
@@ -293,6 +353,7 @@ export const useStore = create((set, get) => ({
     get().setLoading(true)
     get().setError(null)
     try {
+      conversationId = await get().ensureConversationPersisted(conversationId)
       const formData = new FormData()
       files.forEach(file => {
         formData.append('files', file)
@@ -334,6 +395,14 @@ export const useStore = create((set, get) => ({
         ),
       }))
       
+      await get().saveMessage(conversationId, 'user', `识别了 ${data.data?.total_images || files.length} 张图片`)
+      await get().saveMessage(conversationId, 'assistant', resultContent)
+      
+      const conversation = get().conversations.find(c => c.id === conversationId)
+      if (conversation && conversation.messages.length === 2) {
+        await get().saveConversation(conversation)
+      }
+      
       return data
     } catch (error) {
       get().setError(error.message)
@@ -343,13 +412,37 @@ export const useStore = create((set, get) => ({
     }
   },
 
-  addConversation: () => {
+  addConversation: async () => {
+    try {
+      const data = await request(`/chat-sessions?title=${encodeURIComponent('New Chat')}`, {
+        method: 'POST',
+      })
+      if (data.success && data.data) {
+        const newConversation = {
+          id: data.data.id,
+          title: data.data.title,
+          messages: data.data.messages || [],
+          createdAt: data.data.createdAt ? new Date(data.data.createdAt) : new Date(),
+          updatedAt: data.data.updatedAt ? new Date(data.data.updatedAt) : new Date(),
+          persisted: true,
+        }
+        set((state) => ({
+          conversations: [...state.conversations, newConversation],
+          activeConversationId: newConversation.id,
+        }))
+        return newConversation.id
+      }
+    } catch (error) {
+      console.error('Failed to create conversation:', error)
+    }
+    
     const newId = Date.now().toString()
     const newConversation = {
       id: newId,
-      title: 'New Conversation',
+      title: 'New Chat',
       messages: [],
       createdAt: new Date(),
+      persisted: false,
     }
     set((state) => ({
       conversations: [...state.conversations, newConversation],
@@ -358,11 +451,52 @@ export const useStore = create((set, get) => ({
     return newId
   },
 
+  ensureConversationPersisted: async (conversationId) => {
+    const token = getToken()
+    if (!token) return conversationId
+    const conv = get().conversations.find(c => c.id === conversationId)
+    if (!conv || conv.persisted) return conversationId
+    try {
+      const data = await request(`/chat-sessions?title=${encodeURIComponent(conv.title || 'New Chat')}`, {
+        method: 'POST',
+      })
+      if (data.success && data.data) {
+        const newId = data.data.id
+        set((state) => ({
+          conversations: state.conversations.map(c =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  id: newId,
+                  persisted: true,
+                  createdAt: data.data.createdAt ? new Date(data.data.createdAt) : c.createdAt,
+                  updatedAt: data.data.updatedAt ? new Date(data.data.updatedAt) : c.updatedAt,
+                }
+              : c
+          ),
+          activeConversationId: state.activeConversationId === conversationId ? newId : state.activeConversationId,
+        }))
+        return newId
+      }
+    } catch (error) {
+      console.error('Failed to persist conversation:', error)
+    }
+    return conversationId
+  },
+
   setActiveConversation: (id) => {
     set({ activeConversationId: id })
   },
 
-  closeConversation: (id) => {
+  closeConversation: async (id) => {
+    try {
+      await request(`/chat-sessions/${id}`, {
+        method: 'DELETE',
+      })
+    } catch (error) {
+      console.error('Failed to delete conversation:', error)
+    }
+    
     set((state) => {
       const conversations = state.conversations.filter((c) => c.id !== id)
       let newActiveId = state.activeConversationId
@@ -393,7 +527,8 @@ export const useStore = create((set, get) => ({
     })
   },
 
-  sendMessage: (conversationId, content) => {
+  sendMessage: async (conversationId, content) => {
+    conversationId = await get().ensureConversationPersisted(conversationId)
     const trimmedContent = content.trim().toLowerCase()
     
     if (trimmedContent.includes('标志识别') || trimmedContent.includes('交通标志') || trimmedContent.includes('信号灯')) {
@@ -417,6 +552,11 @@ export const useStore = create((set, get) => ({
             : c
         ),
       }))
+      
+      const conversation = get().conversations.find(c => c.id === conversationId)
+      if (conversation && conversation.messages.length === 1) {
+        await get().saveConversation(conversation)
+      }
       return
     }
 
@@ -439,13 +579,21 @@ export const useStore = create((set, get) => ({
           : c
       ),
     }))
+    
+    await get().saveMessage(conversationId, 'user', content)
+    
+    const conversation = get().conversations.find(c => c.id === conversationId)
+    if (conversation && conversation.messages.length === 1) {
+      await get().saveConversation(conversation)
+    }
 
-    setTimeout(() => {
+    setTimeout(async () => {
+      const responseContent = generateResponse()
       const assistantMessage = {
         id: (Date.now() + 1).toString(),
         conversationId,
         role: 'assistant',
-        content: generateResponse(),
+        content: responseContent,
         createdAt: new Date(),
         type: 'text',
       }
@@ -457,6 +605,8 @@ export const useStore = create((set, get) => ({
             : c
         ),
       }))
+      
+      await get().saveMessage(conversationId, 'assistant', responseContent)
     }, 1000)
   },
 
