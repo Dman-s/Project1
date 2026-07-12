@@ -13,7 +13,7 @@ export function ChatArea() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [activeConversationId, messages.length])
 
   const handleImageUpload = useCallback(async (e, conversationId) => {
     const files = Array.from(e.target.files)

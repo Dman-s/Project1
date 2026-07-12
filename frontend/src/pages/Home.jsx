@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { User, LogOut, Sun, Moon, Mail, Lock, Upload, X, Check } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { User, LogOut, Sun, Moon, Mail, Lock, Upload, X } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { LeftSidebar } from '../components/LeftSidebar'
 import { ConversationTabs } from '../components/ConversationTabs'
@@ -10,7 +10,7 @@ import { LoginModal } from '../components/LoginModal'
 export default function Home() {
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false)
   const [showLogout, setShowLogout] = useState(false)
-  let logoutTimeout = null
+  const logoutTimeout = useRef(null)
   const [sidebarWidth, setSidebarWidth] = useState(256)
   const [chatInputHeight, setChatInputHeight] = useState(180)
   const [isResizingSidebar, setIsResizingSidebar] = useState(false)
@@ -33,7 +33,7 @@ export default function Home() {
     if (token && !user) {
       getCurrentUser()
     }
-  }, [])
+  }, [getCurrentUser, user])
 
   const handleCreateConversation = async () => {
     await addConversation()
@@ -108,10 +108,10 @@ export default function Home() {
 
               {user && (
                 <div className="relative" onMouseEnter={() => {
-                  clearTimeout(logoutTimeout)
+                  clearTimeout(logoutTimeout.current)
                   setShowLogout(true)
                 }} onMouseLeave={() => {
-                  logoutTimeout = setTimeout(() => setShowLogout(false), 500)
+                  logoutTimeout.current = setTimeout(() => setShowLogout(false), 500)
                 }}>
                   <div className="flex items-center gap-3">
                     <div className="relative">
