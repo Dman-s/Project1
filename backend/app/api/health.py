@@ -27,7 +27,7 @@ async def health_check():
 
 
 @router.get("/api/health/detail")
-async def health_check_detail():
+def health_check_detail():
     """
     详细健康检查
 
@@ -70,10 +70,13 @@ async def health_check_detail():
 
     # ── 检查 MinIO ───────────────────────────────────
     try:
-        from app.storage.minio_client import MinIOClient
+        import urllib.request
 
-        minio = MinIOClient()
-        minio.client.list_buckets()
+        scheme = "https" if settings.MINIO_SECURE else "http"
+        url = f"{scheme}://{settings.MINIO_ENDPOINT}/minio/health/live"
+        with urllib.request.urlopen(url, timeout=3) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"MinIO health status: {response.status}")
         services["minio"] = {"status": "healthy", "message": "MinIO 连接正常"}
     except Exception as e:
         services["minio"] = {
