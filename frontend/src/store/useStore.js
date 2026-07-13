@@ -52,6 +52,30 @@ const formatSignResult = (data) => {
   return result
 }
 
+const formatLicensePlateResult = (data) => {
+  if (!data) return "识别完成"
+  let result = `识别时间：${data.time || ""}\n\n`
+  const plates = data.plates || data.results || []
+  result += `共识别 ${plates.length} 个车牌\n`
+  if (plates.length > 0) {
+    result += "\n🚗 车牌识别结果：\n"
+    plates.forEach((plate, i) => {
+      result += `\n${i + 1}. 车牌号：${plate.plate_number || plate.text || "未知"}`
+      if (plate.confidence) result += `，置信度 ${plate.confidence}%`
+      result += "\n"
+    })
+  } else { result += "\n未识别到车牌" }
+  return result
+}
+
+const formatHumanResult = (data) => {
+  if (!data) return "识别完成"
+  let result = `识别时间：${data.time || ""}\n\n`
+  result += `共识别 ${data.total_images || 0} 张图片\n`
+  result += `检测到 ${data.total_humans || data.total_objects || 0} 人\n`
+  return result
+}
+
 const getToken = () => {
   return localStorage.getItem('token')
 }
@@ -410,6 +434,60 @@ export const useStore = create((set, get) => ({
     } finally {
       get().setLoading(false)
     }
+  },
+
+  recognizeLicensePlate: async (conversationId, files) => {
+    get().setLoading(true)
+    try {
+      conversationId = await get().ensureConversationPersisted(conversationId)
+      const formData = new FormData()
+      files.forEach(f => formData.append("files", f))
+      const data = await requestFormData("/sign-analyzer/batch", { method: "POST", body: formData })
+      const resultContent = formatLicensePlateResult(data.data)
+      set((state) => ({
+        conversations: state.conversations.map(c =>
+          c.id === conversationId ? {
+            ...c,
+            title: c.messages.length === 0 ? "车牌识别" : c.title,
+            messages: [...c.messages,
+              { id: Date.now().toString(), conversationId, role: "user", content: `上传了 ${files.length} 张图片进行车牌识别`, createdAt: new Date() },
+              { id: (Date.now()+1).toString(), conversationId, role: "assistant", content: resultContent, createdAt: new Date(), type: "text" },
+            ],
+          } : c
+        ),
+      }))
+      await get().saveMessage(conversationId, "user", `上传了 ${files.length} 张图片进行车牌识别`)
+      await get().saveMessage(conversationId, "assistant", resultContent)
+      return data
+    } catch (error) { get().setError(error.message); throw error }
+    finally { get().setLoading(false) }
+  },
+
+  recognizeHumans: async (conversationId, files) => {
+    get().setLoading(true)
+    try {
+      conversationId = await get().ensureConversationPersisted(conversationId)
+      const formData = new FormData()
+      files.forEach(f => formData.append("files", f))
+      const data = await requestFormData("/sign-analyzer/batch", { method: "POST", body: formData })
+      const resultContent = formatHumanResult(data.data)
+      set((state) => ({
+        conversations: state.conversations.map(c =>
+          c.id === conversationId ? {
+            ...c,
+            title: c.messages.length === 0 ? "行人检测" : c.title,
+            messages: [...c.messages,
+              { id: Date.now().toString(), conversationId, role: "user", content: `上传了 ${files.length} 张图片进行行人检测`, createdAt: new Date() },
+              { id: (Date.now()+1).toString(), conversationId, role: "assistant", content: resultContent, createdAt: new Date(), type: "text" },
+            ],
+          } : c
+        ),
+      }))
+      await get().saveMessage(conversationId, "user", `上传了 ${files.length} 张图片进行行人检测`)
+      await get().saveMessage(conversationId, "assistant", resultContent)
+      return data
+    } catch (error) { get().setError(error.message); throw error }
+    finally { get().setLoading(false) }
   },
 
   addConversation: async () => {
