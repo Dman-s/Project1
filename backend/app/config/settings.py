@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ── 应用基础配置 ──────────────────────────────────
-    APP_NAME: str = "111"
+    APP_NAME: str = "L Agent Platform"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
