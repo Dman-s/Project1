@@ -1,4 +1,10 @@
+from pathlib import Path
+
+from pydantic import Field
 from pydantic_settings import BaseSettings
+
+
+BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -7,20 +13,63 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
+    APP_MODE: str = "production"
     # ── 数据库配置 ────────────────────────────────────
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
     DB_NAME: str = "L_agent"
     DB_USER: str = "Ladmin"
     DB_PASSWORD: str = "Ladmin"
+    DATABASE_URL: str | None = None
+    LOCAL_DATABASE_PATH: str = "./data/local.db"
+    REDIS_ENABLED: bool | None = None
+    MINIO_ENABLED: bool | None = None
+    # ── 本地 YOLO 推理配置 ────────────────────────────
+    YOLO_MODEL_PATH: str = "../training/runs/tt100k_yolo11n_gpu/weights/best.pt"
+    YOLO_DEVICE: str = "auto"
+    YOLO_CONFIDENCE: float = Field(default=0.25, ge=0.0, le=1.0)
+    YOLO_IOU: float = Field(default=0.45, ge=0.0, le=1.0)
+    YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
+    YOLO_MAX_BATCH_IMAGES: int = Field(default=20, ge=1)
+    YOLO_MAX_IMAGE_BYTES: int = Field(default=10 * 1024 * 1024, ge=1)
+    GTSRB_MODEL_PATH: str = "../training/runs/gtsrb_yolo11n_cls_gpu/weights/best.pt"
+    GTSRB_DEVICE: str = "auto"
+    GTSRB_IMAGE_SIZE: int = Field(default=128, ge=32)
+    GTSRB_CROP_MAX_DIMENSION: int = Field(default=512, ge=32)
+    DETECTION_OUTPUT_DIR: str = "./uploads/detections"
     # ── 日志配置 ──────────────────────────────────────
     LOG_DIR: str = "logs"  # 日志目录（相对于 backend/）
     LOG_MAX_BYTES: int = 10 * 1024 * 1024  # 单文件最大 10MB
     LOG_BACKUP_COUNT: int = 5  # 保留 5 份历史日志
 
     @property
-    def DATABASE_URL(self) -> str:
+    def is_local(self) -> bool:
+        return self.APP_MODE.strip().lower() == "local"
+
+    @property
+    def database_url(self) -> str:
+        if self.DATABASE_URL and self.DATABASE_URL.strip():
+            return self.DATABASE_URL
+        if self.is_local:
+            return f"sqlite:///{self.LOCAL_DATABASE_PATH}"
         return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+    @staticmethod
+    def _resolve_backend_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        return path.resolve() if path.is_absolute() else (BACKEND_DIR / path).resolve()
+
+    @property
+    def yolo_model_path(self) -> Path:
+        return self._resolve_backend_path(self.YOLO_MODEL_PATH)
+
+    @property
+    def gtsrb_model_path(self) -> Path:
+        return self._resolve_backend_path(self.GTSRB_MODEL_PATH)
+
+    @property
+    def detection_output_path(self) -> Path:
+        return self._resolve_backend_path(self.DETECTION_OUTPUT_DIR)
 
     # ── Redis 配置 ────────────────────────────────────
     REDIS_HOST: str = "localhost"
@@ -31,12 +80,20 @@ class Settings(BaseSettings):
         """构造 Redis 连接字符串"""
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 
+    @property
+    def redis_enabled(self) -> bool:
+        return self.REDIS_ENABLED if self.REDIS_ENABLED is not None else not self.is_local
+
     # ── MinIO 配置 ────────────────────────────────────
     MINIO_ENDPOINT: str = "localhost:9000"
     MINIO_ACCESS_KEY: str = "minioadmin"
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_BUCKET: str = "images"
     MINIO_SECURE: bool = False
+
+    @property
+    def minio_enabled(self) -> bool:
+        return self.MINIO_ENABLED if self.MINIO_ENABLED is not None else not self.is_local
     # ── JWT 认证配置 ──────────────────────────────────
     JWT_SECRET_KEY: str = "your-super-secret-key-change-in-production"
     JWT_ALGORITHM: str = "HS256"
@@ -44,9 +101,6 @@ class Settings(BaseSettings):
     # ── 百度OCR API 配置 ──────────────────────────────
     BAIDU_API_KEY: str = "your-baidu-api-key"
     BAIDU_SECRET_KEY: str = "your-baidu-secret-key"
-    # ── SignAnalayzer 智能体配置 ────────────────────
-    SIGN_ANALYZER_API_KEY: str = "your-sign-analyzer-api-key"
-    SIGN_ANALYZER_API_URL: str = "https://api.example.com/sign-analyzer"
     # ── CORS 配置 ────────────────────────────────────
     ALLOWED_ORIGINS: str = (
         "http://localhost:3000,http://localhost:5173,http://localhost:8080"
