@@ -71,13 +71,8 @@ app.include_router(chat_session_router)
 uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
 if os.path.exists(uploads_dir):
     app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# ── 请求日志中间件（最后添加，最先执行）───────────────
 app.add_middleware(RequestLogMiddleware)
 
 

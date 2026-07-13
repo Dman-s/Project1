@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ── 应用基础配置 ──────────────────────────────────
-    APP_NAME: str = "111"
+    APP_NAME: str = "L Agent Platform"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # ── 百度OCR API 配置 ──────────────────────────────
     BAIDU_API_KEY: str = "your-baidu-api-key"
     BAIDU_SECRET_KEY: str = "your-baidu-secret-key"
-    # ── SignAnalayzer 智能体配置 ────────────────────
+    # ── SignAnalyzer 智能体配置 ────────────────────
     SIGN_ANALYZER_API_KEY: str = "your-sign-analyzer-api-key"
     SIGN_ANALYZER_API_URL: str = "https://api.example.com/sign-analyzer"
     # ── CORS 配置 ────────────────────────────────────
