@@ -3,10 +3,15 @@
 import argparse
 import csv
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.services.gtsrb_labels import GTSRB_LABELS
+try:
+    from app.services.gtsrb_labels import GTSRB_LABELS
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from app.services.gtsrb_labels import GTSRB_LABELS
 
 
 @dataclass(frozen=True)

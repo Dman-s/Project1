@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
     YOLO_MAX_BATCH_IMAGES: int = Field(default=20, ge=1)
     YOLO_MAX_IMAGE_BYTES: int = Field(default=10 * 1024 * 1024, ge=1)
-    GTSRB_MODEL_PATH: str = "../training/runs/gtsrb_yolo11n_cls_gpu/weights/best.pt"
+    GTSRB_MODEL_PATH: str = "../training/runs/gtsrb_yolo11n_cls_gpu_final/weights/best.pt"
     GTSRB_DEVICE: str = "auto"
     GTSRB_IMAGE_SIZE: int = Field(default=128, ge=32)
     GTSRB_CROP_MAX_DIMENSION: int = Field(default=512, ge=32)
