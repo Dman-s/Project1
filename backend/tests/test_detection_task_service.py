@@ -116,6 +116,9 @@ def test_run_task_registers_model_persists_results_and_writes_annotation(
     assert outcome.task.total_inference_time == 12.5
     assert outcome.device == "0"
     assert outcome.images[0]["traffic_signs"][0]["type"] == "pl60"
+    assert outcome.images[0]["traffic_signs"][0]["class_name"] == "pl60"
+    assert outcome.images[0]["traffic_signs"][0]["class_name_cn"] == "最高限速 60 km/h"
+    assert outcome.images[0]["traffic_signs"][0]["display_name"] == "最高限速 60 km/h"
     assert outcome.images[0]["annotated_image_url"].startswith(
         "/uploads/detections/"
     )
@@ -133,6 +136,11 @@ def test_run_task_registers_model_persists_results_and_writes_annotation(
         .count()
         == 1
     )
+    scene = db_session.query(DetectionScene).filter_by(name="tt100k_traffic_signs").one()
+    assert scene.class_names_cn["pl60"] == "最高限速 60 km/h"
+    record = db_session.query(DetectionResult).filter_by(task_id=outcome.task.id).one()
+    assert record.class_name == "pl60"
+    assert record.class_name_cn == "最高限速 60 km/h"
     assert db_session.query(ModelVersion).filter_by(is_default=True).count() == 1
 
 
@@ -227,6 +235,7 @@ def test_auto_mode_persists_gtsrb_classification(db_session, tmp_path):
     assert result["dataset"] == "gtsrb"
     assert result["traffic_signs"][0]["class_id"] == 16
     assert result["traffic_signs"][0]["bbox"] == [0.0, 0.0, 53.0, 54.0]
+    assert result["traffic_signs"][0]["display_name"] == "禁止 3.5 吨以上车辆通行"
     record = db_session.query(DetectionResult).filter_by(task_id=outcome.task.id).one()
     assert record.class_id == 16
     assert record.bbox == [0.0, 0.0, 53.0, 54.0]

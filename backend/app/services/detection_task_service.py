@@ -16,6 +16,7 @@ from app.entity.db_models import (
 from app.services.gtsrb_classifier import LocalSignClassifier
 from app.services.gtsrb_labels import GTSRB_LABELS_ZH
 from app.services.recognition_router import LocalRecognitionRouter
+from app.services.tt100k_labels import TT100K_LABELS_ZH_BY_CODE, tt100k_label_zh
 from app.services.yolo_detector import (
     ImagePrediction,
     InvalidImageError,
@@ -112,13 +113,23 @@ class DetectionTaskService:
                 ),
                 category="traffic",
                 class_names=ordered_names,
-                class_names_cn=None,
+                class_names_cn=(
+                    None if is_classification else TT100K_LABELS_ZH_BY_CODE
+                ),
                 is_active=True,
             )
             db.add(scene)
             db.flush()
         elif scene.class_names != ordered_names:
             scene.class_names = ordered_names
+            if is_classification:
+                scene.class_names_cn = None
+            else:
+                scene.class_names_cn = TT100K_LABELS_ZH_BY_CODE
+        elif is_classification:
+            scene.class_names_cn = None
+        elif scene.class_names_cn != TT100K_LABELS_ZH_BY_CODE:
+            scene.class_names_cn = TT100K_LABELS_ZH_BY_CODE
 
         model_path = str(predictor.model_path)
         model_version = (
@@ -365,7 +376,7 @@ class DetectionTaskService:
                 GTSRB_LABELS_ZH[detection.class_id]
                 if recognition_mode == "classify"
                 and 0 <= detection.class_id < len(GTSRB_LABELS_ZH)
-                else None
+                else tt100k_label_zh(detection.class_name)
             )
             items.append(
                 {
