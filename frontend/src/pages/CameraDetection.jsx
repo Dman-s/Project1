@@ -202,8 +202,8 @@ export default function CameraDetection() {
         >
           <ArrowLeft className="h-4 w-4" />
         </button>
-        <div className="min-w-0 flex-1">
-          <h1 className="truncate text-base font-semibold">摄像头实时检测</h1>
+        <div className="min-w-36 flex-1">
+          <h1 className="whitespace-nowrap text-base font-semibold">摄像头实时检测</h1>
           <p className="text-xs text-dark-400">{isActive ? `设备 ${device}` : '摄像头未连接'}</p>
         </div>
 
