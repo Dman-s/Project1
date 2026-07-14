@@ -75,6 +75,7 @@ logs/
 
 # ── 数据文件 ────────────────────────────────────────
 backend/datasets/
+backend/data/video_status/
 *.csv
 *.xlsx
 *.parquet
@@ -120,6 +121,7 @@ build/
 # ── 测试覆盖率 ───────────────────────────────────────
 .coverage
 .pytest_cache/
+.playwright-cli/
 htmlcov/
 .tox/
 .hypothesis/
