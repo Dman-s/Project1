@@ -158,3 +158,6 @@ dmypy.json
 training/raw/
 training/datasets/
 training/runs/
+
+# Local git worktrees
+.worktrees/
