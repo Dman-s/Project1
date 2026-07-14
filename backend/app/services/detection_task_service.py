@@ -16,7 +16,7 @@ from app.entity.db_models import (
 from app.services.gtsrb_classifier import LocalSignClassifier
 from app.services.gtsrb_labels import GTSRB_LABELS_ZH
 from app.services.recognition_router import LocalRecognitionRouter
-from app.services.tt100k_labels import TT100K_LABELS_ZH_BY_CODE, tt100k_label_zh
+from app.services.tt100k_labels import tt100k_label_zh
 from app.services.yolo_detector import (
     ImagePrediction,
     InvalidImageError,
@@ -96,6 +96,13 @@ class DetectionTaskService:
         )
         class_names = predictor.class_names
         ordered_names = [class_names[key] for key in sorted(class_names)]
+        class_names_cn = None
+        if not is_classification:
+            class_names_cn = {
+                name: label
+                for name in ordered_names
+                if (label := tt100k_label_zh(name)) is not None
+            }
 
         scene = (
             db.query(DetectionScene)
@@ -113,23 +120,16 @@ class DetectionTaskService:
                 ),
                 category="traffic",
                 class_names=ordered_names,
-                class_names_cn=(
-                    None if is_classification else TT100K_LABELS_ZH_BY_CODE
-                ),
+                class_names_cn=class_names_cn,
                 is_active=True,
             )
             db.add(scene)
             db.flush()
-        elif scene.class_names != ordered_names:
-            scene.class_names = ordered_names
-            if is_classification:
-                scene.class_names_cn = None
-            else:
-                scene.class_names_cn = TT100K_LABELS_ZH_BY_CODE
-        elif is_classification:
-            scene.class_names_cn = None
-        elif scene.class_names_cn != TT100K_LABELS_ZH_BY_CODE:
-            scene.class_names_cn = TT100K_LABELS_ZH_BY_CODE
+        else:
+            if scene.class_names != ordered_names:
+                scene.class_names = ordered_names
+            if scene.class_names_cn != class_names_cn:
+                scene.class_names_cn = class_names_cn
 
         model_path = str(predictor.model_path)
         model_version = (

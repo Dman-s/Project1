@@ -51,6 +51,12 @@ class FakeDetector:
         )
 
 
+class FakeAliasDetector:
+    model_path = Path("D:/models/alias-best.pt")
+    selected_device = "0"
+    class_names = {0: "i160", 1: "unknown"}
+
+
 class FakeClassifier:
     model_path = Path("D:/models/gtsrb-best.pt")
     selected_device = "0"
@@ -142,6 +148,47 @@ def test_run_task_registers_model_persists_results_and_writes_annotation(
     assert record.class_name == "pl60"
     assert record.class_name_cn == "最高限速 60 km/h"
     assert db_session.query(ModelVersion).filter_by(is_default=True).count() == 1
+
+
+def test_detector_scene_labels_only_include_active_classes(db_session, tmp_path):
+    service = DetectionTaskService(detector=FakeDetector(), output_dir=tmp_path)
+
+    scene, _ = service.ensure_registry(db_session)
+
+    assert scene.class_names == ["p10", "pl60"]
+    assert scene.class_names_cn == {
+        "p10": "禁止小型客车驶入",
+        "pl60": "最高限速 60 km/h",
+    }
+
+
+def test_ensure_registry_repairs_stale_detector_scene_labels(db_session, tmp_path):
+    service = DetectionTaskService(detector=FakeDetector(), output_dir=tmp_path)
+    scene, _ = service.ensure_registry(db_session)
+    scene.class_names_cn = {"stale": "stale"}
+    db_session.commit()
+
+    refreshed_scene, _ = service.ensure_registry(db_session)
+
+    assert refreshed_scene.class_names == ["p10", "pl60"]
+    assert refreshed_scene.class_names_cn == {
+        "p10": "禁止小型客车驶入",
+        "pl60": "最高限速 60 km/h",
+    }
+
+
+def test_detector_scene_labels_preserve_aliases_and_omit_unknowns(
+    db_session, tmp_path
+):
+    service = DetectionTaskService(
+        detector=FakeAliasDetector(),
+        output_dir=tmp_path,
+    )
+
+    scene, _ = service.ensure_registry(db_session)
+
+    assert scene.class_names == ["i160", "unknown"]
+    assert scene.class_names_cn == {"i160": "最低限速 60 km/h"}
 
 
 def test_partial_batch_failure_completes_with_error_summary(db_session, tmp_path):
