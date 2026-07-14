@@ -5,8 +5,24 @@ if (-not (Get-Command Assert-True -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "ProjectEnvironment.Tests.ps1")
 }
 
+if (-not (Get-Command Invoke-CheckedCommand -ErrorAction SilentlyContinue)) {
+    Import-Module (Join-Path $PSScriptRoot "..\lib\ProjectEnvironment.psm1") -Force
+}
+
 function Get-BootstrapScriptPath {
     return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\bootstrap-windows.ps1"))
+}
+
+function Get-DoctorScriptPath {
+    return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\doctor.ps1"))
+}
+
+function Get-StartScriptPath {
+    return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\start.ps1"))
+}
+
+function Get-StopScriptPath {
+    return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\stop.ps1"))
 }
 
 function New-BootstrapFixture {
@@ -132,6 +148,67 @@ function Invoke-BootstrapScriptProcess {
     }
 }
 
+function Invoke-DoctorScriptProcess {
+    param(
+        [string[]]$ArgumentList = @(),
+        [string]$ProjectRoot
+    )
+
+    $doctorScriptPath = Get-DoctorScriptPath
+    $powershellPath = Join-Path $PSHOME "powershell.exe"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powershellPath
+
+    $allArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $doctorScriptPath
+    )
+
+    if ($ProjectRoot) {
+        $allArguments += @("-ProjectRoot", $ProjectRoot)
+    }
+
+    if ($ArgumentList) {
+        $allArguments += $ArgumentList
+    }
+
+    $quotedArguments = foreach ($argument in $allArguments) {
+        if ($argument -notmatch '[\s"]') {
+            $argument
+            continue
+        }
+
+        '"' + $argument.Replace('"', '\"') + '"'
+    }
+
+    $startInfo.Arguments = $quotedArguments -join " "
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+
+    try {
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut = $stdoutTask.GetAwaiter().GetResult()
+            StdErr = $stderrTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function New-NodeRuntimeArchive {
     param(
         [Parameter(Mandatory = $true)][string]$FixtureRoot,
@@ -168,7 +245,12 @@ function Invoke-BootstrapChildScript {
     $fixture = New-TempFixture
     $scriptPath = Join-Path $fixture "child.ps1"
     try {
-        $ScriptContent | Set-Content -LiteralPath $scriptPath -Encoding ASCII
+        $modulePath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\lib\ProjectEnvironment.psm1")).Replace("'", "''")
+        $prefixedContent = @"
+Import-Module '$modulePath' -Force
+$ScriptContent
+"@
+        $prefixedContent | Set-Content -LiteralPath $scriptPath -Encoding ASCII
         $powershellPath = Join-Path $PSHOME "powershell.exe"
         return Invoke-CheckedCommand -FilePath $powershellPath -ArgumentList @(
             "-NoProfile",
@@ -179,6 +261,84 @@ function Invoke-BootstrapChildScript {
         ) -WorkingDirectory $WorkingDirectory
     } finally {
         Remove-TempFixture -Path $fixture
+    }
+}
+
+function Set-FixtureManifestModelContents {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][hashtable]$ModelContents
+    )
+
+    $manifestPath = Join-Path $ProjectRoot "scripts\config\bootstrap-manifest.json"
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    foreach ($model in @($manifest.release.models)) {
+        if (-not $ModelContents.ContainsKey($model.filename)) {
+            continue
+        }
+
+        $content = [string]$ModelContents[$model.filename]
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($content)
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $model.bytes = $bytes.Length
+            $model.sha256 = ([System.BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace("-", "")
+        } finally {
+            $sha256.Dispose()
+        }
+    }
+
+    $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding ASCII
+}
+
+function New-DoctorFixture {
+    $root = New-BootstrapFixture
+
+    foreach ($relativePath in @(
+        "backend\data",
+        "backend\.venv\Scripts",
+        "frontend\node_modules",
+        "models"
+    )) {
+        New-Item -ItemType Directory -Path (Join-Path $root $relativePath) -Force | Out-Null
+    }
+
+    $defaultModels = @{
+        "tt100k-yolo11s-reference42.pt" = "detector-default"
+        "tt100k-yolo11n-common45.pt" = "detector-optional"
+        "gtsrb-yolo11n-cls.pt" = "classifier-default"
+    }
+    Set-FixtureManifestModelContents -ProjectRoot $root -ModelContents $defaultModels
+
+    foreach ($entry in $defaultModels.GetEnumerator()) {
+        [System.IO.File]::WriteAllText((Join-Path $root "models\$($entry.Key)"), [string]$entry.Value, [System.Text.Encoding]::ASCII)
+    }
+
+    [System.IO.File]::WriteAllText((Join-Path $root "backend\.venv\Scripts\python.exe"), "fixture-python", [System.Text.Encoding]::ASCII)
+
+    $envContent = @(
+        "APP_MODE=local",
+        "DATABASE_URL=sqlite:///./data/local.db",
+        "REDIS_ENABLED=false",
+        "MINIO_ENABLED=false",
+        "YOLO_MODEL_PATH=../models/tt100k-yolo11s-reference42.pt",
+        "YOLO_DEVICE=cpu",
+        "GTSRB_MODEL_PATH=../models/gtsrb-yolo11n-cls.pt",
+        "GTSRB_DEVICE=cpu",
+        "JWT_SECRET_KEY=super-secret-fixture-value"
+    ) -join "`r`n"
+    Set-Content -LiteralPath (Join-Path $root "backend\.env") -Value ($envContent + "`r`n") -Encoding ASCII
+
+    return $root
+}
+
+function Start-TestTcpListener {
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+
+    return [pscustomobject]@{
+        Listener = $listener
+        Port = ([int]$listener.LocalEndpoint.Port)
     }
 }
 
@@ -1022,6 +1182,821 @@ try {
                     Assert-Contains -ExpectedSubstring "SkipRuntimeDownload" -Actual ($result.StdOut + $result.StdErr) -Message "Missing runtime failure should mention SkipRuntimeDownload."
                 } finally {
                     Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor script AST parses cleanly, exposes the expected parameters, and stays idle when dot-sourced"
+            Body = {
+                $doctorScriptPath = Get-DoctorScriptPath
+                $tokens = $null
+                $parseErrors = $null
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($doctorScriptPath, [ref]$tokens, [ref]$parseErrors)
+
+                Assert-Equal -Expected 0 -Actual $parseErrors.Count -Message "Doctor script parse errors were found."
+
+                $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+                foreach ($parameterName in @("Device", "Json", "ProjectRoot")) {
+                    Assert-True -Condition ($parameterNames -contains $parameterName) -Message "Missing required doctor parameter '$parameterName'."
+                }
+
+                $escapedDoctorPath = $doctorScriptPath.Replace("'", "''")
+                $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$escapedDoctorPath'
+'dot-sourced'
+"@
+                $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory (Split-Path -Parent $doctorScriptPath)
+                Assert-Equal -Expected "dot-sourced" -Actual $result.StdOut.Trim() -Message "Doctor script should not auto-run when dot-sourced."
+                Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Doctor script emitted unexpected stderr when dot-sourced."
+            }
+        },
+        @{
+            Name = "Doctor fake fixture passes and human and JSON output stay secret-free"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorSystemFacts {
+    param([string]`$ProjectRoot)
+    return [pscustomobject]@{
+        IsWindows = `$true
+        Architecture = 'x64'
+        FreeSpaceBytes = 20GB
+    }
+}
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    return [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    return [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    return [pscustomobject]@{
+        ExitCode = 0
+        Message = 'pip check passed'
+    }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    return [pscustomobject]@{
+        Version = '2.7.1+cpu'
+        CudaBuild = `$null
+        CudaAvailable = `$false
+    }
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+[ordered]@{
+    ExitCode = `$result.ExitCode
+    ResultCount = @(`$result.Results).Count
+    Statuses = @(`$result.Results | ForEach-Object { `$_.status })
+    Human = (Format-DoctorHumanOutput -Results `$result.Results)
+    Json = (Format-DoctorJsonOutput -Results `$result.Results)
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 0 -Actual $state.ExitCode -Message "Doctor fixture should pass."
+                    Assert-True -Condition ($state.ResultCount -gt 0) -Message "Doctor should return a non-empty result set."
+                    Assert-False -Condition (@($state.Statuses | Where-Object { $_ -eq 'FAIL' }).Count -gt 0) -Message "Doctor fixture should not report FAIL."
+                    Assert-Contains -ExpectedSubstring "[PASS]" -Actual $state.Human -Message "Doctor human output should contain PASS markers."
+                    Assert-Contains -ExpectedSubstring '"status":"PASS"' -Actual $state.Json -Message "Doctor JSON output should contain PASS records."
+                    Assert-False -Condition ($state.Human.Contains("super-secret-fixture-value")) -Message "Doctor human output leaked the fixture secret."
+                    Assert-False -Condition ($state.Json.Contains("super-secret-fixture-value")) -Message "Doctor JSON output leaked the fixture secret."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor fails with a nonzero exit code when a required model hash is wrong"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    Set-Content -LiteralPath (Join-Path $fixture "models\tt100k-yolo11s-reference42.pt") -Value "corrupted-model" -Encoding ASCII
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorSystemFacts {
+    param([string]`$ProjectRoot)
+    return [pscustomobject]@{
+        IsWindows = `$true
+        Architecture = 'x64'
+        FreeSpaceBytes = 20GB
+    }
+}
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    return [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    return [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    return [pscustomobject]@{
+        ExitCode = 0
+        Message = 'pip check passed'
+    }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    return [pscustomobject]@{
+        Version = '2.7.1+cpu'
+        CudaBuild = `$null
+        CudaAvailable = `$false
+    }
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+[ordered]@{
+    ExitCode = `$result.ExitCode
+    Human = (Format-DoctorHumanOutput -Results `$result.Results)
+    Json = (Format-DoctorJsonOutput -Results `$result.Results)
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 1 -Actual $state.ExitCode -Message "Doctor should fail when a required model hash is wrong."
+                    Assert-Contains -ExpectedSubstring "[FAIL]" -Actual $state.Human -Message "Doctor human output should mark a bad model hash as FAIL."
+                    Assert-Contains -ExpectedSubstring "hash" -Actual $state.Human.ToLowerInvariant() -Message "Doctor human output should mention the hash problem."
+                    Assert-Contains -ExpectedSubstring '"status":"FAIL"' -Actual $state.Json -Message "Doctor JSON output should include a FAIL record."
+                    Assert-False -Condition ($state.Human.Contains("super-secret-fixture-value")) -Message "Doctor failure output leaked the fixture secret."
+                    Assert-False -Condition ($state.Json.Contains("super-secret-fixture-value")) -Message "Doctor failure JSON leaked the fixture secret."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor reports an occupied random port as WARN without using the fixed app ports"
+            Body = {
+                $listenerState = Start-TestTcpListener
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+`$checks = Get-DoctorPortCheckResults -Ports @($($listenerState.Port))
+[ordered]@{
+    Count = @(`$checks).Count
+    Status = `$checks[0].status
+    Message = `$checks[0].message
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory (Split-Path -Parent (Get-DoctorScriptPath))
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 1 -Actual $state.Count -Message "Doctor should return one port check result for the random port."
+                    Assert-Equal -Expected "WARN" -Actual $state.Status -Message "Occupied doctor port check should WARN."
+                    Assert-Contains -ExpectedSubstring ([string]$listenerState.Port) -Actual $state.Message -Message "Port warning should mention the occupied random port."
+                } finally {
+                    $listenerState.Listener.Stop()
+                }
+            }
+        },
+        @{
+            Name = "Doctor cpu mode accepts a CUDA torch build as usable for CPU inference without failing"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorSystemFacts {
+    param([string]`$ProjectRoot)
+    [pscustomobject]@{
+        IsWindows = `$true
+        Architecture = 'x64'
+        FreeSpaceBytes = 20GB
+    }
+}
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    [pscustomobject]@{
+        ExitCode = 0
+        Message = 'pip check passed'
+    }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    [pscustomobject]@{
+        Version = '2.7.1+cu128'
+        CudaBuild = '12.8'
+        CudaAvailable = `$true
+    }
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device cpu
+`$torchBuild = @(`$result.Results | Where-Object { `$_.name -eq 'torch-build' })[0]
+`$cudaState = @(`$result.Results | Where-Object { `$_.name -eq 'cuda-state' })[0]
+[ordered]@{
+    ExitCode = `$result.ExitCode
+    TorchStatus = `$torchBuild.status
+    TorchMessage = `$torchBuild.message
+    CudaStatus = `$cudaState.status
+    CudaMessage = `$cudaState.message
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 0 -Actual $state.ExitCode -Message "CPU mode should not fail when a CUDA torch wheel is installed."
+                    Assert-True -Condition (@("PASS", "WARN") -contains [string]$state.TorchStatus) -Message "CPU CUDA wheel status should be PASS or WARN."
+                    Assert-True -Condition (@("PASS", "WARN") -contains [string]$state.CudaStatus) -Message "CPU CUDA availability status should be PASS or WARN."
+                    Assert-Contains -ExpectedSubstring "usable" -Actual $state.TorchMessage.ToLowerInvariant() -Message "CPU CUDA wheel message should explain usability."
+                    Assert-Contains -ExpectedSubstring "larger" -Actual $state.TorchMessage.ToLowerInvariant() -Message "CPU CUDA wheel message should mention the larger wheel size."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor auto mode emits a compute-device result resolved to gpu when CUDA is available"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorSystemFacts {
+    param([string]`$ProjectRoot)
+    [pscustomobject]@{
+        IsWindows = `$true
+        Architecture = 'x64'
+        FreeSpaceBytes = 20GB
+    }
+}
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    [pscustomobject]@{
+        ExitCode = 0
+        Message = 'pip check passed'
+    }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    [pscustomobject]@{
+        Version = '2.7.1+cu128'
+        CudaBuild = '12.8'
+        CudaAvailable = `$true
+    }
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+`$compute = @(`$result.Results | Where-Object { `$_.name -eq 'compute-device' })[0]
+[ordered]@{
+    ExitCode = `$result.ExitCode
+    Name = `$compute.name
+    Status = `$compute.status
+    Message = `$compute.message
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 0 -Actual $state.ExitCode -Message "Auto mode with CUDA available should pass."
+                    Assert-Equal -Expected "compute-device" -Actual $state.Name -Message "Compute-device result name mismatch."
+                    Assert-Equal -Expected "PASS" -Actual $state.Status -Message "Compute-device result should PASS."
+                    Assert-Contains -ExpectedSubstring "gpu" -Actual $state.Message.ToLowerInvariant() -Message "Compute-device message should resolve to GPU."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor auto mode emits a compute-device result resolved to cpu when CUDA is unavailable"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorSystemFacts {
+    param([string]`$ProjectRoot)
+    [pscustomobject]@{
+        IsWindows = `$true
+        Architecture = 'x64'
+        FreeSpaceBytes = 20GB
+    }
+}
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    [pscustomobject]@{
+        ExitCode = 0
+        Message = 'pip check passed'
+    }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    [pscustomobject]@{
+        Version = '2.7.1+cpu'
+        CudaBuild = `$null
+        CudaAvailable = `$false
+    }
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+`$compute = @(`$result.Results | Where-Object { `$_.name -eq 'compute-device' })[0]
+[ordered]@{
+    ExitCode = `$result.ExitCode
+    Name = `$compute.name
+    Status = `$compute.status
+    Message = `$compute.message
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 0 -Actual $state.ExitCode -Message "Auto mode with CUDA unavailable should pass."
+                    Assert-Equal -Expected "compute-device" -Actual $state.Name -Message "Compute-device result name mismatch."
+                    Assert-Equal -Expected "PASS" -Actual $state.Status -Message "Compute-device result should PASS."
+                    Assert-Contains -ExpectedSubstring "cpu" -Actual $state.Message.ToLowerInvariant() -Message "Compute-device message should resolve to CPU."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor rejects a project-local Python runtime routed through a junction before execution"
+            Body = {
+                $fixture = New-DoctorFixture
+                $external = New-TempFixture
+                try {
+                    $runtimeRoot = Join-Path $fixture ".runtime"
+                    $pythonLink = Join-Path $runtimeRoot "python"
+                    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+                    New-Item -ItemType Directory -Path $external -Force | Out-Null
+                    [System.IO.File]::WriteAllText((Join-Path $external "python.exe"), "external-python", [System.Text.Encoding]::ASCII)
+                    New-Item -ItemType Junction -Path $pythonLink -Target $external | Out-Null
+                    Assert-TestRequiresJunction -Path $pythonLink
+
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorExactPythonVersion {
+    param([string]`$PythonPath, [string]`$ProjectRoot)
+    throw 'python-version-executed'
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+`$python = @(`$result.Results | Where-Object { `$_.name -eq 'python-version' })[0]
+[ordered]@{
+    Status = `$python.status
+    Message = `$python.message
+    Executed = `$python.message.Contains('python-version-executed')
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected "FAIL" -Actual $state.Status -Message "Project-local Python junction should FAIL."
+                    Assert-Contains -ExpectedSubstring "reparse point" -Actual $state.Message.ToLowerInvariant() -Message "Project-local Python junction failure should mention reparse points."
+                    Assert-False -Condition $state.Executed -Message "Project-local Python junction must fail before executing Python."
+                } finally {
+                    Remove-TempFixture -Path $external
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor rejects a project-local Node runtime routed through a junction before execution"
+            Body = {
+                $fixture = New-DoctorFixture
+                $external = New-TempFixture
+                try {
+                    $runtimeRoot = Join-Path $fixture ".runtime"
+                    $nodeLink = Join-Path $runtimeRoot "node"
+                    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+                    New-Item -ItemType Directory -Path $external -Force | Out-Null
+                    [System.IO.File]::WriteAllText((Join-Path $external "node.exe"), "external-node", [System.Text.Encoding]::ASCII)
+                    [System.IO.File]::WriteAllText((Join-Path $external "npm.cmd"), "@echo npm", [System.Text.Encoding]::ASCII)
+                    New-Item -ItemType Junction -Path $nodeLink -Target $external | Out-Null
+                    Assert-TestRequiresJunction -Path $nodeLink
+
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    [pscustomobject]@{
+        ExitCode = 0
+        Message = 'pip check passed'
+    }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    [pscustomobject]@{
+        Version = '2.7.1+cpu'
+        CudaBuild = `$null
+        CudaAvailable = `$false
+    }
+}
+function Get-DoctorExactNodeVersion {
+    param([string]`$NodePath, [string]`$ProjectRoot)
+    throw 'node-version-executed'
+}
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+`$node = @(`$result.Results | Where-Object { `$_.name -eq 'node-version' })[0]
+[ordered]@{
+    Status = `$node.status
+    Message = `$node.message
+    Executed = `$node.message.Contains('node-version-executed')
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected "FAIL" -Actual $state.Status -Message "Project-local Node junction should FAIL."
+                    Assert-Contains -ExpectedSubstring "reparse point" -Actual $state.Message.ToLowerInvariant() -Message "Project-local Node junction failure should mention reparse points."
+                    Assert-False -Condition $state.Executed -Message "Project-local Node junction must fail before executing Node."
+                } finally {
+                    Remove-TempFixture -Path $external
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor rejects an external PATH Node executable leaf reparse point before execution without applying project containment"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+`$projectRoot = '$escapedFixture'
+`$fakeNodePath = 'C:\external\node.exe'
+`$fakeNpmPath = 'C:\external\npm.cmd'
+function Get-Command {
+    param([string]`$Name)
+    if (`$Name -eq 'node.exe') {
+        return [pscustomobject]@{ Source = `$fakeNodePath }
+    }
+
+    Microsoft.PowerShell.Core\Get-Command @PSBoundParameters
+}
+function Test-Path {
+    param([string]`$LiteralPath, [string]`$PathType)
+    switch (`$LiteralPath) {
+        `$fakeNodePath { return `$true }
+        `$fakeNpmPath { return `$true }
+        default { return Microsoft.PowerShell.Management\Test-Path @PSBoundParameters }
+    }
+}
+function Get-Item {
+    param([string]`$LiteralPath, [switch]`$Force, [string]`$ErrorAction)
+    if (`$LiteralPath -eq `$fakeNodePath) {
+        return [pscustomobject]@{ Attributes = [System.IO.FileAttributes]::ReparsePoint }
+    }
+
+    Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
+}
+function Invoke-CheckedCommand {
+    param([string]`$FilePath, [string[]]`$ArgumentList)
+    throw 'node-version-executed'
+}
+`$paths = [pscustomobject]@{
+    Root = `$projectRoot
+    LocalNodePath = (Join-Path `$projectRoot '.runtime\node\node.exe')
+    LocalNpmPath = (Join-Path `$projectRoot '.runtime\node\npm.cmd')
+}
+`$manifest = [pscustomobject]@{
+    runtime = [pscustomobject]@{
+        node = [pscustomobject]@{ version = '24.18.0' }
+    }
+}
+try {
+    Get-DoctorNodeInfo -Paths `$paths -Manifest `$manifest | Out-Null
+    throw 'Expected external PATH node reparse rejection.'
+} catch {
+    [ordered]@{
+        Message = `$_.Exception.Message
+        Executed = `$_.Exception.Message.Contains('node-version-executed')
+        Containment = `$_.Exception.Message.Contains('project root')
+    } | ConvertTo-Json -Compress
+}
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Contains -ExpectedSubstring "reparse point" -Actual $state.Message.ToLowerInvariant() -Message "External PATH node reparse rejection should mention reparse points."
+                    Assert-False -Condition $state.Executed -Message "External PATH node reparse rejection must occur before execution."
+                    Assert-False -Condition $state.Containment -Message "External PATH node reparse rejection must not use project containment messaging."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor Json mode converts early fatal setup errors into one safe FAIL result with empty stderr"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    Set-Content -LiteralPath (Join-Path $fixture "scripts\config\bootstrap-manifest.json") -Value "{not-json" -Encoding ASCII
+                    Set-Content -LiteralPath (Join-Path $fixture "backend\.env") -Value @(
+                        "APP_MODE=local",
+                        "DATABASE_URL=sqlite:///./data/local.db",
+                        "JWT_SECRET_KEY=super-secret-fixture-value"
+                    ) -Encoding ASCII
+
+                    $result = Invoke-DoctorScriptProcess -ProjectRoot $fixture -ArgumentList @("-Json")
+                    Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Doctor Json mode should return nonzero for early fatal setup errors."
+                    Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Doctor Json mode should keep stderr empty for handled setup errors."
+
+                    $json = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 1 -Actual @($json).Count -Message "Doctor Json mode should emit exactly one normalized setup result."
+                    Assert-Equal -Expected "FAIL" -Actual $json[0].status -Message "Doctor Json mode setup result should FAIL."
+                    Assert-True -Condition ([bool]$json[0].required) -Message "Doctor Json mode setup result should be required."
+                    Assert-Contains -ExpectedSubstring "manifest" -Actual ([string]$json[0].message).ToLowerInvariant() -Message "Doctor Json mode setup result should explain the manifest failure."
+                    Assert-False -Condition (($result.StdOut + $result.StdErr).Contains("super-secret-fixture-value")) -Message "Doctor Json mode setup failure leaked a secret."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor Json mode normalizes invalid Device into one safe FAIL result with empty stderr"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $result = Invoke-DoctorScriptProcess -ProjectRoot $fixture -ArgumentList @("-Json", "-Device", "bogus")
+                    Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Doctor Json mode should return nonzero for invalid Device."
+                    Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Doctor Json invalid Device should keep stderr empty."
+
+                    $json = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 1 -Actual @($json).Count -Message "Doctor Json invalid Device should emit exactly one normalized result."
+                    Assert-Equal -Expected "FAIL" -Actual $json[0].status -Message "Doctor Json invalid Device result should FAIL."
+                    Assert-True -Condition ([bool]$json[0].required) -Message "Doctor Json invalid Device result should be required."
+                    Assert-Contains -ExpectedSubstring "device" -Actual ([string]$json[0].message).ToLowerInvariant() -Message "Doctor Json invalid Device should mention the device category."
+                    Assert-False -Condition (($result.StdOut + $result.StdErr).Contains("super-secret-fixture-value")) -Message "Doctor Json invalid Device leaked a secret."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor Json mode normalizes a missing ProjectEnvironment module into one safe FAIL result with empty stderr"
+            Body = {
+                $fixture = New-DoctorFixture
+                $doctorRoot = Split-Path -Parent (Get-DoctorScriptPath)
+                $modulePath = Join-Path $doctorRoot "lib\ProjectEnvironment.psm1"
+                $backupPath = $modulePath + ".json-test-backup"
+                try {
+                    Move-Item -LiteralPath $modulePath -Destination $backupPath -Force
+                    $result = Invoke-DoctorScriptProcess -ProjectRoot $fixture -ArgumentList @("-Json")
+                    Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Doctor Json mode should return nonzero when ProjectEnvironment is missing."
+                    Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Doctor Json missing-module path should keep stderr empty."
+
+                    $json = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 1 -Actual @($json).Count -Message "Doctor Json missing-module path should emit exactly one normalized result."
+                    Assert-Equal -Expected "FAIL" -Actual $json[0].status -Message "Doctor Json missing-module result should FAIL."
+                    Assert-True -Condition ([bool]$json[0].required) -Message "Doctor Json missing-module result should be required."
+                    Assert-Contains -ExpectedSubstring "module" -Actual ([string]$json[0].message).ToLowerInvariant() -Message "Doctor Json missing-module result should mention the module category."
+                    Assert-False -Condition (($result.StdOut + $result.StdErr).Contains("super-secret-fixture-value")) -Message "Doctor Json missing-module path leaked a secret."
+                } finally {
+                    if (Test-Path -LiteralPath $backupPath) {
+                        Move-Item -LiteralPath $backupPath -Destination $modulePath -Force
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor sanitizes secret-bearing probe seam failures in human and JSON output"
+            Body = {
+                $secret = "SENTINEL-SECRET-DOCTOR"
+                $cases = @(
+                    [pscustomobject]@{
+                        Name = "python"
+                        Script = @"
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    throw 'python probe failed: SENTINEL-SECRET-DOCTOR'
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+"@
+                    },
+                    [pscustomobject]@{
+                        Name = "node"
+                        Script = @"
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    throw 'node probe failed: SENTINEL-SECRET-DOCTOR'
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    [pscustomobject]@{ ExitCode = 0; Message = 'pip check passed' }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    [pscustomobject]@{ Version = '2.7.1+cpu'; CudaBuild = `$null; CudaAvailable = `$false }
+}
+"@
+                    },
+                    [pscustomobject]@{
+                        Name = "pip"
+                        Script = @"
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    throw 'pip probe failed: SENTINEL-SECRET-DOCTOR'
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    [pscustomobject]@{ Version = '2.7.1+cpu'; CudaBuild = `$null; CudaAvailable = `$false }
+}
+"@
+                    },
+                    [pscustomobject]@{
+                        Name = "torch"
+                        Script = @"
+function Get-DoctorPythonInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '3.10.11'
+        Path = (Join-Path `$Paths.VenvRoot 'Scripts\python.exe')
+        Source = 'backend-venv'
+    }
+}
+function Get-DoctorNodeInfo {
+    param([object]`$Paths, [object]`$Manifest)
+    [pscustomobject]@{
+        Version = '24.18.0'
+        Path = (Join-Path `$Paths.Root '.runtime\node\node.exe')
+        NpmPath = (Join-Path `$Paths.Root '.runtime\node\npm.cmd')
+        Source = 'path-node'
+    }
+}
+function Invoke-DoctorPipCheck {
+    param([string]`$PythonPath, [string]`$BackendRoot)
+    [pscustomobject]@{ ExitCode = 0; Message = 'pip check passed' }
+}
+function Get-DoctorTorchInfo {
+    param([string]`$PythonPath)
+    throw 'torch probe failed: SENTINEL-SECRET-DOCTOR'
+}
+"@
+                    }
+                )
+
+                foreach ($case in $cases) {
+                    $fixture = New-DoctorFixture
+                    try {
+                        $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                        $escapedFixture = $fixture.Replace("'", "''")
+                        $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorSystemFacts {
+    param([string]`$ProjectRoot)
+    [pscustomobject]@{
+        IsWindows = `$true
+        Architecture = 'x64'
+        FreeSpaceBytes = 20GB
+    }
+}
+$($case.Script)
+`$result = Invoke-DoctorMain -ProjectRoot '$escapedFixture' -Device auto
+[ordered]@{
+    Human = (Format-DoctorHumanOutput -Results `$result.Results)
+    Json = (Format-DoctorJsonOutput -Results `$result.Results)
+} | ConvertTo-Json -Compress
+"@
+                        $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                        $state = $result.StdOut | ConvertFrom-Json
+                        Assert-False -Condition ($state.Human.Contains($secret)) -Message "Doctor human output leaked a secret for $($case.Name) seam."
+                        Assert-False -Condition ($state.Json.Contains($secret)) -Message "Doctor JSON output leaked a secret for $($case.Name) seam."
+                    } finally {
+                        Remove-TempFixture -Path $fixture
+                    }
                 }
             }
         }

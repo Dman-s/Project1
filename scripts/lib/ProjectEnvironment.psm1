@@ -563,7 +563,8 @@ function Invoke-CheckedCommand {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
         [string[]]$ArgumentList = @(),
-        [string]$WorkingDirectory = (Get-ProjectRoot)
+        [string]$WorkingDirectory = (Get-ProjectRoot),
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 30
     )
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -582,6 +583,25 @@ function Invoke-CheckedCommand {
         [void]$process.Start()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                }
+            } catch {
+            }
+
+            [void]$process.WaitForExit(5000)
+            try {
+                [void]$stdoutTask.GetAwaiter().GetResult()
+                [void]$stderrTask.GetAwaiter().GetResult()
+            } catch {
+            }
+
+            throw "Process timed out after $TimeoutSeconds seconds: $FilePath $($startInfo.Arguments)"
+        }
+
         $process.WaitForExit()
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()

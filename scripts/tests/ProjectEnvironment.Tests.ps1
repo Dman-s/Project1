@@ -870,6 +870,44 @@ Write-Output "completed"
             }
         },
         @{
+            Name = "Invoke-CheckedCommand times out and terminates the child process without leaking it"
+            Body = {
+                $fixture = New-TempFixture
+                try {
+                    $scriptPath = Join-Path $fixture "block.ps1"
+                    $pidPath = Join-Path $fixture "child.pid"
+                    @"
+Set-Content -LiteralPath '$($pidPath.Replace("'", "''"))' -Value `$PID -Encoding ASCII
+Start-Sleep -Seconds 30
+"@ | Set-Content -LiteralPath $scriptPath -Encoding ASCII
+
+                    $filePath = Join-Path $PSHOME "powershell.exe"
+                    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    $message = Assert-Throws -Action {
+                        Invoke-CheckedCommand -FilePath $filePath -ArgumentList @(
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            $scriptPath
+                        ) -TimeoutSeconds 2
+                    } -ExpectedMessage "timed out"
+                    $stopwatch.Stop()
+
+                    Assert-True -Condition ($stopwatch.Elapsed.TotalSeconds -lt 10) -Message "Timed-out command did not return in bounded time."
+                    Assert-False -Condition ($message.Contains("STDOUT:")) -Message "Timeout failures must not include child stdout."
+                    Assert-False -Condition ($message.Contains("STDERR:")) -Message "Timeout failures must not include child stderr."
+                    Assert-True -Condition (Test-Path -LiteralPath $pidPath -PathType Leaf) -Message "Timed-out child did not write its pid file."
+
+                    $childPid = [int](Get-Content -LiteralPath $pidPath -Raw).Trim()
+                    Start-Sleep -Milliseconds 200
+                    Assert-True -Condition ($null -eq (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) -Message "Timed-out child process was not terminated."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "Invoke-CheckedCommand throws on non-zero exit code"
             Body = {
                 $filePath = Join-Path $PSHOME "powershell.exe"
