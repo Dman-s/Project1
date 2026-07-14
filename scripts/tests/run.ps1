@@ -1,21 +1,39 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$testsPath = Join-Path $PSScriptRoot "ProjectEnvironment.Tests.ps1"
+$suites = @(
+    [pscustomobject]@{
+        Path = (Join-Path $PSScriptRoot "ProjectEnvironment.Tests.ps1")
+        Invoker = "Invoke-ProjectEnvironmentTests"
+    },
+    [pscustomobject]@{
+        Path = (Join-Path $PSScriptRoot "BootstrapScripts.Tests.ps1")
+        Invoker = "Invoke-BootstrapScriptTests"
+    }
+)
 
-try {
-    . $testsPath
-    $summary = Invoke-ProjectEnvironmentTests
-} catch {
-    Write-Host "FAIL Suite initialization"
-    Write-Host $_.Exception.Message
-    Write-Host ""
-    Write-Host "Passed: 0"
-    Write-Host "Failed: 1"
-    exit 1
+$allResults = @()
+$passedCount = 0
+$failedCount = 0
+
+foreach ($suite in $suites) {
+    try {
+        . $suite.Path
+        $summary = & $suite.Invoker
+        $allResults += $summary.Results
+        $passedCount += $summary.Passed
+        $failedCount += $summary.Failed
+    } catch {
+        $allResults += [pscustomobject]@{
+            Name = "Suite initialization: $($suite.Path)"
+            Passed = $false
+            Error = $_.Exception.Message
+        }
+        $failedCount++
+    }
 }
 
-foreach ($result in $summary.Results) {
+foreach ($result in $allResults) {
     if ($result.Passed) {
         Write-Host "PASS $($result.Name)"
     } else {
@@ -25,10 +43,10 @@ foreach ($result in $summary.Results) {
 }
 
 Write-Host ""
-Write-Host "Passed: $($summary.Passed)"
-Write-Host "Failed: $($summary.Failed)"
+Write-Host "Passed: $passedCount"
+Write-Host "Failed: $failedCount"
 
-if ($summary.Failed -gt 0) {
+if ($failedCount -gt 0) {
     exit 1
 }
 
