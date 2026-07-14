@@ -135,6 +135,18 @@ def _model_payload(outcome) -> dict:
     }
 
 
+def _recognition_metadata(model_type: str | None) -> dict:
+    is_classification = model_type == "yolo11n-cls"
+    return {
+        "recognition_mode": "classify" if is_classification else "detect",
+        "result_type": "classification" if is_classification else "detection",
+        "dataset": "gtsrb" if is_classification else "tt100k",
+        "model_family": (
+            "gtsrb-classifier" if is_classification else "tt100k-detector"
+        ),
+    }
+
+
 def _task_payload(task) -> dict:
     model = task.model_version
     return {
@@ -155,10 +167,12 @@ def _task_payload(task) -> dict:
         "error_message": task.error_message,
         "created_at": task.created_at,
         "completed_at": task.completed_at,
+        **_recognition_metadata(model.model_type if model else None),
     }
 
 
 def _result_payload(result) -> dict:
+    model_version = result.task.model_version if result.task else None
     return {
         "id": result.id,
         "task_id": result.task_id,
@@ -172,6 +186,9 @@ def _result_payload(result) -> dict:
         "inference_time": result.inference_time,
         "image_width": result.image_width,
         "image_height": result.image_height,
+        **_recognition_metadata(
+            model_version.model_type if model_version else None
+        ),
         "created_at": result.created_at,
     }
 

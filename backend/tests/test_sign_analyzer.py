@@ -1,5 +1,6 @@
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
@@ -229,5 +230,42 @@ def test_task_list_and_detail_are_scoped_to_authenticated_user(
     assert task_list.json()["data"][0]["id"] == task_id
     assert detail.status_code == 200
     assert detail.json()["data"]["task"]["id"] == task_id
-    assert detail.json()["data"]["results"][0]["class_name"] == "pl60"
+    assert detail.json()["data"]["task"]["recognition_mode"] == "detect"
+    assert detail.json()["data"]["task"]["result_type"] == "detection"
+    assert detail.json()["data"]["task"]["dataset"] == "tt100k"
+    assert detail.json()["data"]["task"]["model_family"] == "tt100k-detector"
+    persisted_result = detail.json()["data"]["results"][0]
+    assert persisted_result["class_name"] == "pl60"
+    assert persisted_result["recognition_mode"] == "detect"
+    assert persisted_result["result_type"] == "detection"
+    assert persisted_result["dataset"] == "tt100k"
+    assert persisted_result["model_family"] == "tt100k-detector"
     assert hidden.status_code == 404
+
+
+def test_persisted_classifier_result_exposes_routing_metadata():
+    result = SimpleNamespace(
+        id=1,
+        task_id=2,
+        task=SimpleNamespace(
+            model_version=SimpleNamespace(model_type="yolo11n-cls")
+        ),
+        image_path="00000.png",
+        annotated_image_url="/uploads/detections/2/0000_00000.jpg",
+        class_name="Vehicles over 3.5 metric tons prohibited",
+        class_name_cn="禁止 3.5 吨以上车辆通行",
+        class_id=16,
+        confidence=1.0,
+        bbox=[0.0, 0.0, 48.0, 48.0],
+        inference_time=2.0,
+        image_width=48,
+        image_height=48,
+        created_at=None,
+    )
+
+    payload = sign_analyzer._result_payload(result)
+
+    assert payload["recognition_mode"] == "classify"
+    assert payload["result_type"] == "classification"
+    assert payload["dataset"] == "gtsrb"
+    assert payload["model_family"] == "gtsrb-classifier"
