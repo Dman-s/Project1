@@ -56,6 +56,14 @@ class DeferredExecutor:
         self.shutdown_options = options
 
 
+class FailingExecutor:
+    def submit(self, *_args, **_kwargs):
+        raise RuntimeError("executor internals")
+
+    def shutdown(self, **_options):
+        return None
+
+
 class FakeCapture:
     def __init__(self, frames, opened=True, fps=10.0):
         self.frames = list(frames)
@@ -169,6 +177,7 @@ def build_service(
         session_factory=worker_sessions,
         output_dir=tmp_path / "detections",
         temp_dir=tmp_path / "videos",
+        status_dir=tmp_path / "video-status",
         capture_factory=lambda _path: capture,
         executor=executor or ImmediateExecutor(),
         max_pending_tasks=max_pending_tasks,
@@ -356,6 +365,7 @@ def test_terminal_progress_expires_and_reloads_complete_sidecar(
         session_factory=service.session_factory,
         output_dir=tmp_path / "detections",
         temp_dir=tmp_path / "videos",
+        status_dir=tmp_path / "video-status",
         capture_factory=lambda _path: capture,
         executor=ImmediateExecutor(),
         progress_registry=VideoProgressRegistry(),
@@ -365,6 +375,13 @@ def test_terminal_progress_expires_and_reloads_complete_sidecar(
     assert reloaded["metadata"]["fps"] == 10.0
     assert len(reloaded["key_frames"]) == 1
     assert reloaded["key_frames"][0]["traffic_signs"] == []
+    assert (tmp_path / "video-status" / f"{submission.task_id}.json").is_file()
+    assert not (
+        tmp_path
+        / "detections"
+        / str(submission.task_id)
+        / "video_status.json"
+    ).exists()
 
 
 def test_worker_hides_detector_filesystem_errors(db_session, tmp_path):
@@ -401,3 +418,38 @@ def test_progress_uses_planned_sample_window_when_max_frames_truncates_video():
         sample_rate=5,
         max_frames=2,
     ) == 6
+
+
+def test_executor_submission_failure_marks_task_failed_and_cleans_files(
+    db_session, tmp_path
+):
+    user = create_user(db_session, "video_submit_failure_user")
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)]),
+        executor=FailingExecutor(),
+    )
+
+    with pytest.raises(Exception, match="无法创建视频检测任务"):
+        service.submit(
+            db=db_session,
+            user_id=user.id,
+            filename="road.mp4",
+            content=b"video",
+            confidence=0.25,
+            iou=0.45,
+            image_size=640,
+            sample_rate=1,
+            max_frames=1,
+        )
+    db_session.expire_all()
+    task = (
+        db_session.query(DetectionTask)
+        .filter(DetectionTask.user_id == user.id)
+        .one()
+    )
+
+    assert task.status == "failed"
+    assert task.error_message == "无法创建视频检测任务，请稍后重试"
+    assert list((tmp_path / "videos").glob("**/*")) == []

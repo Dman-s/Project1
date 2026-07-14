@@ -130,7 +130,11 @@ export default function CameraDetection() {
       videoRef.current.srcObject = stream
       await videoRef.current.play()
       if (session !== sessionRef.current) {
-        releaseMedia()
+        stream.getTracks().forEach((track) => track.stop())
+        if (streamRef.current === stream) streamRef.current = null
+        if (videoRef.current?.srcObject === stream) {
+          videoRef.current.srcObject = null
+        }
         return
       }
       setConnection('connecting')

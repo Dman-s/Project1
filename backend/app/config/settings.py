@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     VIDEO_MAX_PENDING_TASKS: int = Field(default=4, ge=1, le=32)
     VIDEO_PROGRESS_TTL_SECONDS: int = Field(default=3600, ge=1)
     VIDEO_TEMP_DIR: str = "./uploads/videos"
+    VIDEO_STATUS_DIR: str = "./data/video_status"
     CAMERA_CPU_IMAGE_SIZE: int = Field(default=416, ge=32)
     CAMERA_GPU_IMAGE_SIZE: int = Field(default=640, ge=32)
     CAMERA_MAX_FRAME_BYTES: int = Field(default=2 * 1024 * 1024, ge=1)
@@ -93,6 +94,10 @@ class Settings(BaseSettings):
     @property
     def video_temp_path(self) -> Path:
         return self._resolve_backend_path(self.VIDEO_TEMP_DIR)
+
+    @property
+    def video_status_path(self) -> Path:
+        return self._resolve_backend_path(self.VIDEO_STATUS_DIR)
 
     # ── Redis 配置 ────────────────────────────────────
     REDIS_HOST: str = "localhost"

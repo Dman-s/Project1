@@ -91,6 +91,7 @@ class VideoDetectionService:
         session_factory=SessionLocal,
         output_dir: str | Path | None = None,
         temp_dir: str | Path | None = None,
+        status_dir: str | Path | None = None,
         capture_factory=None,
         executor=None,
         progress_registry: VideoProgressRegistry | None = None,
@@ -102,6 +103,7 @@ class VideoDetectionService:
         self.output_dir = Path(output_dir or self.task_service.output_dir)
         self.task_service.output_dir = self.output_dir
         self.temp_dir = Path(temp_dir or settings.video_temp_path)
+        self.status_dir = Path(status_dir or settings.video_status_path)
         self.capture_factory = capture_factory or cv2.VideoCapture
         self.executor = executor or ThreadPoolExecutor(
             max_workers=settings.VIDEO_WORKERS,
@@ -134,6 +136,9 @@ class VideoDetectionService:
             raise VideoQueueFullError("视频检测队列已满，请稍后重试")
 
         future_submitted = False
+        task_id = None
+        source_dir = None
+        progress_created = False
         try:
             safe_filename = Path(filename).name or "video.mp4"
             scene, model_version = self.task_service.ensure_registry(db)
@@ -168,27 +173,28 @@ class VideoDetectionService:
                 raise VideoProcessingError(task.error_message) from exc
 
             initial_state = {
-            "task_id": task_id,
-            "status": "pending",
-            "progress": 0,
-            "filename": safe_filename,
-            "processed_frames": 0,
-            "sampled_frames": 0,
-            "total_objects": 0,
-            "total_inference_time": 0.0,
-            "average_inference_time": 0.0,
-            "device": self.detector.selected_device,
-            "metadata": {
-                "total_frames": 0,
-                "fps": 0.0,
-                "duration": 0.0,
-                "width": 0,
-                "height": 0,
-            },
-            "key_frames": [],
-            "error": None,
+                "task_id": task_id,
+                "status": "pending",
+                "progress": 0,
+                "filename": safe_filename,
+                "processed_frames": 0,
+                "sampled_frames": 0,
+                "total_objects": 0,
+                "total_inference_time": 0.0,
+                "average_inference_time": 0.0,
+                "device": self.detector.selected_device,
+                "metadata": {
+                    "total_frames": 0,
+                    "fps": 0.0,
+                    "duration": 0.0,
+                    "width": 0,
+                    "height": 0,
+                },
+                "key_frames": [],
+                "error": None,
             }
             self.progress.create(task_id, initial_state)
+            progress_created = True
             future = self.executor.submit(
                 self._process,
                 task_id,
@@ -205,6 +211,39 @@ class VideoDetectionService:
                 self._futures.add(future)
             future.add_done_callback(self._forget_future)
             return VideoTaskSubmission(task_id=task_id, status="pending")
+        except Exception as exc:
+            if task_id is None:
+                raise
+            public_error = (
+                str(exc)
+                if isinstance(exc, VideoProcessingError)
+                else "无法创建视频检测任务，请稍后重试"
+            )
+            if not isinstance(exc, VideoProcessingError):
+                logger.exception(
+                    "Unable to hand video task %s to the executor",
+                    task_id,
+                )
+            db.rollback()
+            failed_task = db.get(DetectionTask, task_id)
+            if failed_task is not None:
+                failed_task.status = "failed"
+                failed_task.error_message = public_error
+                failed_task.completed_at = datetime.now()
+                db.commit()
+            if progress_created:
+                self.progress.update(
+                    task_id,
+                    status="failed",
+                    progress=100,
+                    error=public_error,
+                )
+                self._persist_terminal_state_safely(task_id)
+            if source_dir is not None:
+                shutil.rmtree(source_dir, ignore_errors=True)
+            if isinstance(exc, VideoProcessingError):
+                raise
+            raise VideoProcessingError(public_error) from exc
         finally:
             if not future_submitted:
                 self._admission.release()
@@ -428,10 +467,9 @@ class VideoDetectionService:
         state = self.progress.get(task_id)
         if state is None:
             return
-        task_dir = self.output_dir / str(task_id)
-        task_dir.mkdir(parents=True, exist_ok=True)
-        status_path = task_dir / "video_status.json"
-        temporary_path = task_dir / "video_status.json.tmp"
+        self.status_dir.mkdir(parents=True, exist_ok=True)
+        status_path = self.status_dir / f"{task_id}.json"
+        temporary_path = self.status_dir / f"{task_id}.json.tmp"
         temporary_path.write_text(
             json.dumps(state, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
@@ -448,7 +486,7 @@ class VideoDetectionService:
             )
 
     def _load_terminal_state(self, task_id: int) -> dict | None:
-        status_path = self.output_dir / str(task_id) / "video_status.json"
+        status_path = self.status_dir / f"{task_id}.json"
         if not status_path.is_file():
             return None
         try:
