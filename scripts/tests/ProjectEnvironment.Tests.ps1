@@ -788,6 +788,120 @@ function Get-ProjectEnvironmentTests {
             }
         },
         @{
+            Name = "Get-ProjectProcessIdentity accepts both ProcessId and Pid for a harmless child process"
+            Body = {
+                $fixture = New-TempFixture
+                $process = $null
+                try {
+                    $scriptPath = Join-Path $fixture "identity-child.ps1"
+                    @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+while ($true) {
+    Start-Sleep -Milliseconds 250
+}
+'@ | Set-Content -LiteralPath $scriptPath -Encoding ASCII
+
+                    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $startInfo.FileName = (Join-Path $PSHOME "powershell.exe")
+                    $startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+                    $startInfo.UseShellExecute = $false
+                    $startInfo.CreateNoWindow = $true
+
+                    $process = New-Object System.Diagnostics.Process
+                    $process.StartInfo = $startInfo
+                    [void]$process.Start()
+
+                    Start-Sleep -Seconds 1
+
+                    $byProcessId = Get-ProjectProcessIdentity -ProcessId $process.Id
+                    $byPid = Get-ProjectProcessIdentity -Pid $process.Id
+
+                    Assert-Equal -Expected $process.Id -Actual $byProcessId.Pid -Message "ProcessId lookup should return the child pid."
+                    Assert-Equal -Expected $process.Id -Actual $byPid.Pid -Message "Pid alias lookup should return the child pid."
+                    Assert-Equal -Expected $byProcessId.Pid -Actual $byPid.Pid -Message "ProcessId and Pid should resolve the same child process."
+                } finally {
+                    if ($null -ne $process) {
+                        try {
+                            if (-not $process.HasExited) {
+                                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {
+                        } finally {
+                            $process.Dispose()
+                        }
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Test-ProjectProcessIdentity rejects a command line mismatch when the actual command line is available"
+            Body = {
+                $identity = Get-ProjectProcessIdentity
+                $mutated = [pscustomobject]@{
+                    Pid = $identity.Pid
+                    ExecutablePath = $identity.ExecutablePath
+                    StartTimeUtc = $identity.StartTimeUtc
+                    CommandLine = ([string]$identity.CommandLine) + " --mismatch"
+                }
+
+                Assert-False -Condition (Test-ProjectProcessIdentity -RecordedIdentity $mutated) -Message "Identity comparison should fail when the actual command line is available and mismatched."
+            }
+        },
+        @{
+            Name = "Test-ProjectProcessIdentity rejects a required command line when the actual child command line is unavailable"
+            Body = {
+                $fixture = New-TempFixture
+                $process = $null
+                try {
+                    $scriptPath = Join-Path $fixture "identity-child.ps1"
+                    @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+while ($true) {
+    Start-Sleep -Milliseconds 250
+}
+'@ | Set-Content -LiteralPath $scriptPath -Encoding ASCII
+
+                    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $startInfo.FileName = (Join-Path $PSHOME "powershell.exe")
+                    $startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+                    $startInfo.UseShellExecute = $false
+                    $startInfo.CreateNoWindow = $true
+
+                    $process = New-Object System.Diagnostics.Process
+                    $process.StartInfo = $startInfo
+                    [void]$process.Start()
+                    Start-Sleep -Seconds 1
+
+                    $identity = Get-ProjectProcessIdentity -ProcessId $process.Id
+                    Assert-True -Condition ([string]::IsNullOrWhiteSpace([string]$identity.CommandLine)) -Message "This test requires the child command line to be unavailable."
+
+                    $recorded = [pscustomobject]@{
+                        Pid = $identity.Pid
+                        ExecutablePath = $identity.ExecutablePath
+                        StartTimeUtc = $identity.StartTimeUtc.ToString("o")
+                        CommandLine = "powershell.exe -NoProfile distinctive-project-role-backend"
+                    }
+
+                    Assert-False -Condition (Test-ProjectProcessIdentity -RecordedIdentity $recorded -ProcessId $process.Id) -Message "Identity comparison should fail closed when the required child command line is unavailable."
+                } finally {
+                    if ($null -ne $process) {
+                        try {
+                            if (-not $process.HasExited) {
+                                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {
+                        } finally {
+                            $process.Dispose()
+                        }
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "Test-ProjectProcessIdentity rejects mismatched identities"
             Body = {
                 $identity = Get-ProjectProcessIdentity

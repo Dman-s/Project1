@@ -471,7 +471,7 @@ function Test-PathInsideRoot {
 }
 
 function Get-ProjectProcessIdentity {
-    param([int]$ProcessId = $PID)
+    param([Alias("Pid")][int]$ProcessId = $PID)
 
     $process = Get-Process -Id $ProcessId -ErrorAction Stop
     $record = $null

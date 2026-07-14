@@ -209,6 +209,80 @@ function Invoke-DoctorScriptProcess {
     }
 }
 
+function Invoke-StopScriptProcess {
+    param(
+        [string[]]$ArgumentList = @(),
+        [string]$ProjectRoot,
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 30
+    )
+
+    $stopScriptPath = Get-StopScriptPath
+    $powershellPath = Join-Path $PSHOME "powershell.exe"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powershellPath
+
+    $allArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $stopScriptPath
+    )
+
+    if ($ProjectRoot) {
+        $allArguments += @("-ProjectRoot", $ProjectRoot)
+    }
+
+    if ($ArgumentList) {
+        $allArguments += $ArgumentList
+    }
+
+    $quotedArguments = foreach ($argument in $allArguments) {
+        if ($argument -notmatch '[\s"]') {
+            $argument
+            continue
+        }
+
+        '"' + $argument.Replace('"', '\"') + '"'
+    }
+
+    $startInfo.Arguments = $quotedArguments -join " "
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+
+    try {
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                }
+            } catch {
+            }
+
+            [void]$process.WaitForExit(5000)
+            throw "stop.ps1 timed out after $TimeoutSeconds seconds."
+        }
+
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut = $stdoutTask.GetAwaiter().GetResult()
+            StdErr = $stderrTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function New-NodeRuntimeArchive {
     param(
         [Parameter(Mandatory = $true)][string]$FixtureRoot,
@@ -330,6 +404,284 @@ function New-DoctorFixture {
     Set-Content -LiteralPath (Join-Path $root "backend\.env") -Value ($envContent + "`r`n") -Encoding ASCII
 
     return $root
+}
+
+function New-StopFixture {
+    $root = New-BootstrapFixture
+    New-Item -ItemType Directory -Path (Join-Path $root ".runtime\state") -Force | Out-Null
+    return $root
+}
+
+function Get-StopFixtureStatePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][ValidateSet("backend", "frontend")][string]$Role
+    )
+
+    return Join-Path $ProjectRoot ".runtime\state\$Role.json"
+}
+
+function ConvertTo-StopTestArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument -or $Argument.Length -eq 0) {
+        return '""'
+    }
+
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    return '"' + $Argument.Replace('"', '\"') + '"'
+}
+
+function Start-StopTestChildProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][ValidateSet("backend", "frontend")][string]$Role,
+        [string]$Secret = "SENTINEL-STOP-SECRET"
+    )
+
+    $fixture = New-TempFixture
+    $scriptPath = Join-Path $fixture "child.ps1"
+    $marker = "project-role-$Role"
+    $scriptContent = @"
+param(
+    [Parameter(Mandatory = `$true)][string]`$ManagedProjectRoot,
+    [Parameter(Mandatory = `$true)][string]`$ManagedRole,
+    [Parameter(Mandatory = `$true)][string]`$Marker,
+    [Parameter(Mandatory = `$true)][string]`$Secret
+)
+
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+
+while (`$true) {
+    Start-Sleep -Milliseconds 250
+}
+"@
+    Set-Content -LiteralPath $scriptPath -Value $scriptContent -Encoding ASCII
+
+    $powershellPath = Join-Path $PSHOME "powershell.exe"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powershellPath
+    $startInfo.Arguments = (@(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            $scriptPath,
+            "-ManagedProjectRoot",
+            $ProjectRoot,
+            "-ManagedRole",
+            $Role,
+            "-Marker",
+            $marker,
+            "-Secret",
+            $Secret
+        ) | ForEach-Object { ConvertTo-StopTestArgument -Argument $_ }) -join " "
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+
+    $identity = $null
+    $deadline = [datetime]::UtcNow.AddSeconds(10)
+    while ([datetime]::UtcNow -lt $deadline) {
+        if ($process.HasExited) {
+            $process.Dispose()
+            throw "Stop test child exited before identity capture."
+        }
+
+        try {
+            $identity = Get-ProjectProcessIdentity -ProcessId $process.Id
+            if ($null -ne $identity) {
+                break
+            }
+        } catch {
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ($null -eq $identity) {
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        } catch {
+        }
+        $process.Dispose()
+        throw "Stop test child identity was unavailable."
+    }
+
+    return [pscustomobject]@{
+        Process = $process
+        Fixture = $fixture
+        ScriptPath = $scriptPath
+        ProjectRoot = $ProjectRoot
+        Role = $Role
+        Marker = $marker
+        Secret = $Secret
+        Identity = $identity
+        IntendedCommandLine = "$powershellPath $($startInfo.Arguments)"
+    }
+}
+
+function Stop-StopTestChildProcess {
+    param($Child)
+
+    if ($null -eq $Child) {
+        return
+    }
+
+    if ($null -ne $Child.Process) {
+        try {
+            if (-not $Child.Process.HasExited) {
+                Stop-Process -Id $Child.Process.Id -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 300
+            }
+        } catch {
+        } finally {
+            $Child.Process.Dispose()
+        }
+    }
+
+    if ($Child.Fixture) {
+        Remove-TempFixture -Path $Child.Fixture
+    }
+}
+
+function New-StopProcessRecord {
+    param(
+        [Parameter(Mandatory = $true)]$Child,
+        [hashtable]$Overrides
+    )
+
+    $identity = Get-ProjectProcessIdentity -ProcessId $Child.Process.Id
+    $record = [ordered]@{
+        schemaVersion = 1
+        pid = [int]$identity.Pid
+        executablePath = [string]$identity.ExecutablePath
+        startTimeUtc = $identity.StartTimeUtc.ToString("o")
+        commandLine = [string]$identity.CommandLine
+        projectRoot = [string]$Child.ProjectRoot
+        role = [string]$Child.Role
+    }
+
+    if ($Overrides) {
+        foreach ($entry in $Overrides.GetEnumerator()) {
+            $record[$entry.Key] = $entry.Value
+        }
+    }
+
+    return $record
+}
+
+function New-StopSyntheticActualIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Child,
+        [hashtable]$Overrides
+    )
+
+    $identity = if ($Child.Identity) { $Child.Identity } else { Get-ProjectProcessIdentity -ProcessId $Child.Process.Id }
+    $syntheticCommandLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$($Child.ScriptPath)`" -ManagedProjectRoot `"$($Child.ProjectRoot)`" -ManagedRole $($Child.Role) -Marker $($Child.Marker)"
+    $actualIdentity = [ordered]@{
+        Pid = [int]$identity.Pid
+        ExecutablePath = [string]$identity.ExecutablePath
+        StartTimeUtc = $identity.StartTimeUtc
+        CommandLine = $syntheticCommandLine
+    }
+
+    if ($Overrides) {
+        foreach ($entry in $Overrides.GetEnumerator()) {
+            $actualIdentity[$entry.Key] = $entry.Value
+        }
+    }
+
+    return [pscustomobject]$actualIdentity
+}
+
+function New-StopRecordFromSyntheticIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Child,
+        [Parameter(Mandatory = $true)]$ActualIdentity,
+        [hashtable]$Overrides
+    )
+
+    $record = [ordered]@{
+        schemaVersion = 1
+        pid = [int]$ActualIdentity.Pid
+        executablePath = [string]$ActualIdentity.ExecutablePath
+        startTimeUtc = ([datetime]$ActualIdentity.StartTimeUtc).ToString("o")
+        commandLine = [string]$ActualIdentity.CommandLine
+        projectRoot = [string]$Child.ProjectRoot
+        role = [string]$Child.Role
+    }
+
+    if ($Overrides) {
+        foreach ($entry in $Overrides.GetEnumerator()) {
+            $record[$entry.Key] = $entry.Value
+        }
+    }
+
+    return $record
+}
+
+function New-StopIdentityComparer {
+    param([Parameter(Mandatory = $true)]$ActualIdentity)
+
+    return {
+        param($RecordedIdentity, $ProcessId)
+
+        if ([int]$RecordedIdentity.Pid -ne [int]$ActualIdentity.Pid) {
+            return $false
+        }
+
+        if (-not ([System.IO.Path]::GetFullPath([string]$RecordedIdentity.ExecutablePath)).Equals([System.IO.Path]::GetFullPath([string]$ActualIdentity.ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+
+        $recordedStart = [datetime]::Parse([string]$RecordedIdentity.StartTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+        $actualStart = ([datetime]$ActualIdentity.StartTimeUtc).ToUniversalTime()
+        if ($recordedStart -ne $actualStart) {
+            return $false
+        }
+
+        return ([string]$RecordedIdentity.CommandLine).Equals([string]$ActualIdentity.CommandLine, [System.StringComparison]::Ordinal)
+    }.GetNewClosure()
+}
+
+function Write-StopProcessRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][ValidateSet("backend", "frontend")][string]$Role,
+        [Parameter(Mandatory = $true)]$Record
+    )
+
+    $path = Get-StopFixtureStatePath -ProjectRoot $ProjectRoot -Role $Role
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+
+    if ($Record -is [string]) {
+        Set-Content -LiteralPath $path -Value $Record -Encoding ASCII
+    } else {
+        Set-Content -LiteralPath $path -Value (ConvertTo-CanonicalJson -Object $Record) -Encoding ASCII
+    }
+
+    return $path
+}
+
+function Get-NonexistentProcessId {
+    $maxProcessId = [int]((Get-Process | Measure-Object -Property Id -Maximum).Maximum)
+    $candidate = $maxProcessId + 4096
+
+    while ($true) {
+        if ($null -eq (Get-Process -Id $candidate -ErrorAction SilentlyContinue)) {
+            return $candidate
+        }
+
+        $candidate++
+    }
 }
 
 function Start-TestTcpListener {
@@ -1157,6 +1509,582 @@ try {
                     Assert-False -Condition $state.DoctorRan -Message "Late workflow failure should not run doctor."
                     Assert-False -Condition $state.StartRan -Message "Late workflow failure should not run start."
                 } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop script AST parses cleanly, exposes the expected parameters, and stays idle when dot-sourced"
+            Body = {
+                $stopScriptPath = Get-StopScriptPath
+                $tokens = $null
+                $parseErrors = $null
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($stopScriptPath, [ref]$tokens, [ref]$parseErrors)
+
+                Assert-Equal -Expected 0 -Actual $parseErrors.Count -Message "Stop script parse errors were found."
+
+                $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+                foreach ($parameterName in @("ProjectRoot", "TimeoutSeconds")) {
+                    Assert-True -Condition ($parameterNames -contains $parameterName) -Message "Missing required stop parameter '$parameterName'."
+                }
+
+                $escapedStopPath = $stopScriptPath.Replace("'", "''")
+                $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$escapedStopPath'
+'dot-sourced'
+"@
+                $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory (Split-Path -Parent $stopScriptPath)
+                Assert-Equal -Expected "dot-sourced" -Actual $result.StdOut.Trim() -Message "Stop script should not auto-run when dot-sourced."
+                Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Stop script emitted unexpected stderr when dot-sourced."
+            }
+        },
+        @{
+            Name = "Stop succeeds when backend and frontend state records are absent"
+            Body = {
+                $fixture = New-StopFixture
+                try {
+                    $result = Invoke-StopScriptProcess -ProjectRoot $fixture
+                    Assert-Equal -Expected 0 -Actual $result.ExitCode -Message "Stop should succeed when no state records exist."
+                    Assert-Contains -ExpectedSubstring "backend" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop output should mention backend state."
+                    Assert-Contains -ExpectedSubstring "frontend" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop output should mention frontend state."
+                    Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Stop should keep stderr empty when records are absent."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop refuses a malformed backend state record and preserves it"
+            Body = {
+                $fixture = New-StopFixture
+                try {
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record '{"pid":'
+                    $before = Get-Content -LiteralPath $path -Raw
+                    $result = Invoke-StopScriptProcess -ProjectRoot $fixture
+
+                    Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Stop should refuse malformed backend state."
+                    Assert-Contains -ExpectedSubstring "backend" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop refusal should mention backend."
+                    Assert-Contains -ExpectedSubstring "invalid" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop refusal should report invalid state."
+                    Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Malformed backend record must be preserved."
+                    Assert-Equal -Expected $before -Actual (Get-Content -LiteralPath $path -Raw) -Message "Malformed backend record content changed."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop refuses a missing or unsupported backend record schemaVersion and preserves the record"
+            Body = {
+                $cases = @(
+                    [pscustomobject]@{
+                        Name = "missing"
+                        Overrides = @{}
+                        RemoveSchema = $true
+                    },
+                    [pscustomobject]@{
+                        Name = "unsupported"
+                        Overrides = @{ schemaVersion = 2 }
+                        RemoveSchema = $false
+                    }
+                )
+
+                foreach ($case in $cases) {
+                    $fixture = New-StopFixture
+                    try {
+                        $record = [ordered]@{
+                            schemaVersion = 1
+                            pid = (Get-NonexistentProcessId)
+                            executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                            startTimeUtc = [datetime]::UtcNow.ToString("o")
+                            commandLine = "$fixture project-role-backend"
+                            projectRoot = $fixture
+                            role = "backend"
+                        }
+                        foreach ($entry in $case.Overrides.GetEnumerator()) {
+                            $record[$entry.Key] = $entry.Value
+                        }
+                        if ($case.RemoveSchema) {
+                            $record.Remove("schemaVersion")
+                        }
+                        $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+                        $before = Get-Content -LiteralPath $path -Raw
+
+                        $result = Invoke-StopScriptProcess -ProjectRoot $fixture
+                        Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Stop should refuse the $($case.Name) schemaVersion case."
+                        Assert-Contains -ExpectedSubstring "backend" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop should mention backend for the $($case.Name) schemaVersion case."
+                        Assert-Contains -ExpectedSubstring "invalid" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop should report invalid state for the $($case.Name) schemaVersion case."
+                        Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Stop should preserve the record for the $($case.Name) schemaVersion case."
+                        Assert-Equal -Expected $before -Actual (Get-Content -LiteralPath $path -Raw) -Message "Stop changed the record for the $($case.Name) schemaVersion case."
+                    } finally {
+                        Remove-TempFixture -Path $fixture
+                    }
+                }
+            }
+        },
+        @{
+            Name = "Stop refuses non-UTC startTimeUtc encodings and preserves the backend record"
+            Body = {
+                $cases = @(
+                    [pscustomobject]@{
+                        Name = "local"
+                        Value = ([datetime]::SpecifyKind([datetime]::UtcNow.ToLocalTime(), [System.DateTimeKind]::Local)).ToString("o")
+                    },
+                    [pscustomobject]@{
+                        Name = "no-offset"
+                        Value = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
+                    },
+                    [pscustomobject]@{
+                        Name = "plus-08"
+                        Value = ([datetimeoffset]::Parse("2026-07-15T12:34:56.1234567+08:00", [System.Globalization.CultureInfo]::InvariantCulture)).ToString("o")
+                    }
+                )
+
+                foreach ($case in $cases) {
+                    $fixture = New-StopFixture
+                    try {
+                        $record = [ordered]@{
+                            schemaVersion = 1
+                            pid = (Get-NonexistentProcessId)
+                            executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                            startTimeUtc = $case.Value
+                            commandLine = "$fixture project-role-backend"
+                            projectRoot = $fixture
+                            role = "backend"
+                        }
+                        $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+                        $before = Get-Content -LiteralPath $path -Raw
+
+                        $result = Invoke-StopScriptProcess -ProjectRoot $fixture
+                        Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Stop should refuse the $($case.Name) startTimeUtc encoding."
+                        Assert-Contains -ExpectedSubstring "backend" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop should mention backend for the $($case.Name) startTimeUtc encoding."
+                        Assert-Contains -ExpectedSubstring "invalid" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop should report invalid state for the $($case.Name) startTimeUtc encoding."
+                        Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Stop should preserve the record for the $($case.Name) startTimeUtc encoding."
+                        Assert-Equal -Expected $before -Actual (Get-Content -LiteralPath $path -Raw) -Message "Stop changed the record for the $($case.Name) startTimeUtc encoding."
+                    } finally {
+                        Remove-TempFixture -Path $fixture
+                    }
+                }
+            }
+        },
+        @{
+            Name = "Stop removes a stale backend state record when the PID no longer exists"
+            Body = {
+                $fixture = New-StopFixture
+                try {
+                    $stalePid = Get-NonexistentProcessId
+                    $record = [ordered]@{
+                        schemaVersion = 1
+                        pid = $stalePid
+                        executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                        startTimeUtc = [datetime]::UtcNow.ToString("o")
+                        commandLine = "$fixture project-role-backend"
+                        projectRoot = $fixture
+                        role = "backend"
+                    }
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+
+                    $result = Invoke-StopScriptProcess -ProjectRoot $fixture
+                    Assert-Equal -Expected 0 -Actual $result.ExitCode -Message "Stop should treat a stale backend record as success."
+                    Assert-False -Condition (Test-Path -LiteralPath $path) -Message "Stale backend record should be removed."
+                    Assert-Contains -ExpectedSubstring "stale" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop should report stale backend cleanup."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop refuses a black-box backend stop when the live child command line is unavailable"
+            Body = {
+                $fixture = New-StopFixture
+                $child = $null
+                try {
+                    $child = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-STOP-SUCCESS"
+                    $record = [ordered]@{
+                        schemaVersion = 1
+                        pid = [int]$child.Identity.Pid
+                        executablePath = [string]$child.Identity.ExecutablePath
+                        startTimeUtc = ([datetime]$child.Identity.StartTimeUtc).ToUniversalTime().ToString("o")
+                        commandLine = [string]$child.IntendedCommandLine
+                        projectRoot = [string]$fixture
+                        role = "backend"
+                    }
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+
+                    $result = Invoke-StopScriptProcess -ProjectRoot $fixture -ArgumentList @("-TimeoutSeconds", "5")
+                    Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Stop should refuse the black-box backend stop when live command line lookup is unavailable."
+                    Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Black-box backend refusal should preserve the record."
+                    Assert-Contains -ExpectedSubstring "identity mismatch" -Actual $result.StdOut.ToLowerInvariant() -Message "Black-box backend refusal should report identity mismatch."
+                    Assert-False -Condition (($result.StdOut + $result.StdErr).Contains("SENTINEL-STOP-SUCCESS")) -Message "Stop output leaked the backend child secret."
+                    Assert-True -Condition ([bool](Get-Process -Id $child.Process.Id -ErrorAction SilentlyContinue)) -Message "Black-box backend refusal should leave the child process running."
+                } finally {
+                    Stop-StopTestChildProcess -Child $child
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Injected stop success kills a matching backend child via handle wait and removes its state record"
+            Body = {
+                $fixture = New-StopFixture
+                $child = $null
+                try {
+                    $child = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-STOP-INJECTED"
+                    $actualIdentity = New-StopSyntheticActualIdentity -Child $child
+                    $record = New-StopRecordFromSyntheticIdentity -Child $child -ActualIdentity $actualIdentity
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+                    $stopScriptPath = (Get-StopScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $escapedExecutablePath = ([string]$actualIdentity.ExecutablePath).Replace("'", "''")
+                    $escapedCommandLine = ([string]$actualIdentity.CommandLine).Replace("'", "''")
+                    $startTimeText = ([datetime]$actualIdentity.StartTimeUtc).ToString("o")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$stopScriptPath'
+`$actualIdentity = [pscustomobject]@{
+    Pid = $($actualIdentity.Pid)
+    ExecutablePath = '$escapedExecutablePath'
+    StartTimeUtc = [datetime]::Parse('$startTimeText', [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    CommandLine = '$escapedCommandLine'
+}
+`$identityProvider = { param(`$ProcessHandle) `$actualIdentity }.GetNewClosure()
+`$identityComparer = {
+    param(`$RecordedIdentity, `$ProcessHandle, `$ActualIdentity)
+    if ([int]`$RecordedIdentity.Pid -ne [int]`$ActualIdentity.Pid) { return `$false }
+    if (-not ([System.IO.Path]::GetFullPath([string]`$RecordedIdentity.ExecutablePath)).Equals([System.IO.Path]::GetFullPath([string]`$ActualIdentity.ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) { return `$false }
+    `$recordedStart = [datetime]::Parse([string]`$RecordedIdentity.StartTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    `$actualStart = ([datetime]`$ActualIdentity.StartTimeUtc).ToUniversalTime()
+    if (`$recordedStart -ne `$actualStart) { return `$false }
+    return ([string]`$RecordedIdentity.CommandLine).Equals([string]`$ActualIdentity.CommandLine, [System.StringComparison]::Ordinal)
+}.GetNewClosure()
+`$result = Stop-ManagedRole -RootPath '$escapedFixture' -Role backend -TimeoutSeconds 5 -IdentityProvider `$identityProvider -IdentityComparer `$identityComparer
+[ordered]@{
+    Success = [bool]`$result.Success
+    Message = [string]`$result.Message
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-True -Condition ([bool]$state.Success) -Message "Injected stop success should terminate the matching backend child."
+                    Assert-False -Condition (Test-Path -LiteralPath $path) -Message "Injected stop success should remove the record."
+                    Assert-Contains -ExpectedSubstring "stopped" -Actual ([string]$state.Message).ToLowerInvariant() -Message "Injected stop success should report the backend stop."
+                    Start-Sleep -Milliseconds 500
+                    Assert-False -Condition ([bool](Get-Process -Id $child.Process.Id -ErrorAction SilentlyContinue)) -Message "Injected stop success should leave the child process stopped."
+                } finally {
+                    Stop-StopTestChildProcess -Child $child
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop refuses mismatched executable start time command line or project root and preserves the backend child"
+            Body = {
+                $cases = @(
+                    [pscustomobject]@{
+                        Name = "executable"
+                        Overrides = @{ executablePath = "C:\Windows\System32\cmd.exe" }
+                        Expected = "identity mismatch"
+                    },
+                    [pscustomobject]@{
+                        Name = "start-time"
+                        Overrides = @{ startTimeUtc = [datetime]::UtcNow.AddMinutes(-5).ToString("o") }
+                        Expected = "identity mismatch"
+                    },
+                    [pscustomobject]@{
+                        Name = "command-line"
+                        Overrides = @{ commandLine = "powershell.exe -NoProfile project-role-backend wrong-root SENTINEL-STOP-MISMATCH" }
+                        Expected = "identity mismatch"
+                    },
+                    [pscustomobject]@{
+                        Name = "project-root"
+                        Overrides = @{ projectRoot = (Join-Path $env:TEMP "wrong-root") }
+                        Expected = "project root"
+                    }
+                )
+
+                foreach ($case in $cases) {
+                    $fixture = New-StopFixture
+                    $child = $null
+                    try {
+                        $child = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-STOP-MISMATCH"
+                        $actualOverrides = if ($case.Name -eq "project-root") { $null } else { $case.Overrides }
+                        $recordOverrides = if ($case.Name -eq "project-root") { $case.Overrides } else { $null }
+                        $actualIdentity = New-StopSyntheticActualIdentity -Child $child -Overrides $actualOverrides
+                        $record = New-StopRecordFromSyntheticIdentity -Child $child -ActualIdentity (New-StopSyntheticActualIdentity -Child $child) -Overrides $recordOverrides
+                        $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+                        $before = Get-Content -LiteralPath $path -Raw
+                        $stopScriptPath = (Get-StopScriptPath).Replace("'", "''")
+                        $escapedFixture = $fixture.Replace("'", "''")
+                        $escapedExecutablePath = ([string]$actualIdentity.ExecutablePath).Replace("'", "''")
+                        $escapedCommandLine = ([string]$actualIdentity.CommandLine).Replace("'", "''")
+                        $startTimeText = ([datetime]$actualIdentity.StartTimeUtc).ToString("o")
+                        $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$stopScriptPath'
+`$actualIdentity = [pscustomobject]@{
+    Pid = $($actualIdentity.Pid)
+    ExecutablePath = '$escapedExecutablePath'
+    StartTimeUtc = [datetime]::Parse('$startTimeText', [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    CommandLine = '$escapedCommandLine'
+}
+`$identityProvider = { param(`$ProcessId) `$actualIdentity }.GetNewClosure()
+`$identityComparer = {
+    param(`$RecordedIdentity, `$ProcessId)
+    if ([int]`$RecordedIdentity.Pid -ne [int]`$actualIdentity.Pid) { return `$false }
+    if (-not ([System.IO.Path]::GetFullPath([string]`$RecordedIdentity.ExecutablePath)).Equals([System.IO.Path]::GetFullPath([string]`$actualIdentity.ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) { return `$false }
+    `$recordedStart = [datetime]::Parse([string]`$RecordedIdentity.StartTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    `$actualStart = ([datetime]`$actualIdentity.StartTimeUtc).ToUniversalTime()
+    if (`$recordedStart -ne `$actualStart) { return `$false }
+    return ([string]`$RecordedIdentity.CommandLine).Equals([string]`$actualIdentity.CommandLine, [System.StringComparison]::Ordinal)
+}.GetNewClosure()
+try {
+    `$result = Stop-ManagedRole -RootPath '$escapedFixture' -Role backend -TimeoutSeconds 5 -IdentityProvider `$identityProvider -IdentityComparer `$identityComparer
+    [ordered]@{
+        Success = [bool]`$result.Success
+        Message = [string]`$result.Message
+    } | ConvertTo-Json -Compress
+} catch {
+    [ordered]@{
+        Success = `$false
+        Message = [string]`$_.Exception.Message
+    } | ConvertTo-Json -Compress
+}
+"@
+                        $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                        $state = $result.StdOut | ConvertFrom-Json
+                        Assert-False -Condition ([bool]$state.Success) -Message "Stop should refuse the $($case.Name) mismatch case."
+                        Assert-Contains -ExpectedSubstring "backend" -Actual ([string]$state.Message).ToLowerInvariant() -Message "Stop refusal should mention backend for the $($case.Name) mismatch case."
+                        Assert-Contains -ExpectedSubstring $case.Expected -Actual ([string]$state.Message).ToLowerInvariant() -Message "Stop refusal message mismatch for the $($case.Name) case."
+                        Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Stop should preserve the record for the $($case.Name) mismatch case."
+                        Assert-Equal -Expected $before -Actual (Get-Content -LiteralPath $path -Raw) -Message "Stop changed the record for the $($case.Name) mismatch case."
+                        Assert-True -Condition ([bool](Get-Process -Id $child.Process.Id -ErrorAction SilentlyContinue)) -Message "Stop terminated the backend child during the $($case.Name) mismatch case."
+                        Assert-False -Condition ((([string]$result.StdOut) + ([string]$result.StdErr)).Contains("SENTINEL-STOP-MISMATCH")) -Message "Stop output leaked a secret during the $($case.Name) mismatch case."
+                    } finally {
+                        Stop-StopTestChildProcess -Child $child
+                        Remove-TempFixture -Path $fixture
+                    }
+                }
+            }
+        },
+        @{
+            Name = "Injected stop refuses a start-time change before kill and does not call Kill"
+            Body = {
+                $fixture = New-StopFixture
+                try {
+                    . (Get-StopScriptPath)
+                    $statePath = Get-StopFixtureStatePath -ProjectRoot $fixture -Role backend
+                    $record = [ordered]@{
+                        schemaVersion = 1
+                        pid = 424242
+                        executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                        startTimeUtc = [datetime]::UtcNow.ToString("o")
+                        commandLine = "$fixture project-role-backend"
+                        projectRoot = $fixture
+                        role = "backend"
+                    }
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+                    $startA = [datetime]::UtcNow
+                    $startB = $startA.AddSeconds(1)
+                    $killed = $false
+                    $waitCalled = $false
+                    $fakeProcess = New-Object psobject
+                    Add-Member -InputObject $fakeProcess -NotePropertyName Id -NotePropertyValue 424242
+                    Add-Member -InputObject $fakeProcess -NotePropertyName HasExited -NotePropertyValue $false
+                    Add-Member -InputObject $fakeProcess -NotePropertyName StartTime -NotePropertyValue $startA
+                    Add-Member -InputObject $fakeProcess -MemberType ScriptMethod -Name Refresh -Value {
+                        $this.StartTime = $startB
+                    }.GetNewClosure()
+                    Add-Member -InputObject $fakeProcess -MemberType ScriptMethod -Name Kill -Value {
+                        $script:killed = $true
+                    }.GetNewClosure()
+                    Add-Member -InputObject $fakeProcess -MemberType ScriptMethod -Name WaitForExit -Value {
+                        param([int]$TimeoutMilliseconds)
+                        $script:waitCalled = $true
+                        return $true
+                    }.GetNewClosure()
+                    $processProvider = { param($ProcessId) $fakeProcess }.GetNewClosure()
+                    $identityProvider = {
+                        param($ProcessHandle)
+                        [pscustomobject]@{
+                            Pid = 424242
+                            ExecutablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                            StartTimeUtc = $startA.ToUniversalTime()
+                            CommandLine = "$fixture project-role-backend"
+                        }
+                    }.GetNewClosure()
+                    $identityComparer = { param($RecordedIdentity, $ProcessHandle, $ActualIdentity) return $true }
+
+                    $result = Stop-ManagedRole -RootPath $fixture -Role backend -TimeoutSeconds 5 -ProcessProvider $processProvider -IdentityProvider $identityProvider -IdentityComparer $identityComparer
+                    Assert-False -Condition ([bool]$result.Success) -Message "Stop should refuse a changed start time before kill."
+                    Assert-Contains -ExpectedSubstring "identity mismatch" -Actual $result.Message.ToLowerInvariant() -Message "Start-time change refusal should report identity mismatch."
+                    Assert-False -Condition $killed -Message "Kill must not be called when start time changes before kill."
+                    Assert-False -Condition $waitCalled -Message "WaitForExit must not be called when start time changes before kill."
+                    Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Start-time change refusal should preserve the record."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop refuses a backend state record routed through a junction descendant"
+            Body = {
+                $fixture = New-BootstrapFixture
+                $external = New-TempFixture
+                try {
+                    $runtimeRoot = Join-Path $fixture ".runtime"
+                    $stateLink = Join-Path $runtimeRoot "state"
+                    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+                    New-Item -ItemType Directory -Path $external -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $external "backend.json") -Value "{}" -Encoding ASCII
+                    New-Item -ItemType Junction -Path $stateLink -Target $external | Out-Null
+                    Assert-TestRequiresJunction -Path $stateLink
+
+                    $result = Invoke-StopScriptProcess -ProjectRoot $fixture
+                    Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Stop should refuse reparse-routed backend state."
+                    Assert-Contains -ExpectedSubstring "reparse point" -Actual $result.StdOut.ToLowerInvariant() -Message "Stop reparse refusal should mention reparse points."
+                    Assert-True -Condition (Test-Path -LiteralPath (Join-Path $external "backend.json") -PathType Leaf) -Message "Stop should preserve the external backend record."
+                } finally {
+                    Remove-TempFixture -Path $external
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop rename-then-delete preserves the original record when rename fails"
+            Body = {
+                $fixture = New-StopFixture
+                try {
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record ([ordered]@{
+                        schemaVersion = 1
+                        pid = (Get-NonexistentProcessId)
+                        executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                        startTimeUtc = [datetime]::UtcNow.ToString("o")
+                        commandLine = "$fixture project-role-backend"
+                        projectRoot = $fixture
+                        role = "backend"
+                    })
+                    $before = Get-Content -LiteralPath $path -Raw
+                    $stopScriptPath = (Get-StopScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $escapedPath = $path.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$stopScriptPath'
+function Move-Item {
+    param()
+    throw 'rename-failed'
+}
+try {
+    Remove-StopStateRecord -RootPath '$escapedFixture' -StatePath '$escapedPath'
+    throw 'Expected rename failure.'
+} catch {
+    `$_.Exception.Message
+}
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Contains -ExpectedSubstring "rename-failed" -Actual $result.StdOut -Message "Rename failure should surface the move failure."
+                    Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Rename failure should preserve the original record."
+                    Assert-Equal -Expected $before -Actual (Get-Content -LiteralPath $path -Raw) -Message "Rename failure changed the original record."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop rename-then-delete refuses a quarantine junction leaf and preserves the original record"
+            Body = {
+                $fixture = New-StopFixture
+                $external = New-TempFixture
+                try {
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record ([ordered]@{
+                        schemaVersion = 1
+                        pid = (Get-NonexistentProcessId)
+                        executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                        startTimeUtc = [datetime]::UtcNow.ToString("o")
+                        commandLine = "$fixture project-role-backend"
+                        projectRoot = $fixture
+                        role = "backend"
+                    })
+                    $stateDirectory = Split-Path -Parent $path
+                    $quarantineTarget = Join-Path $stateDirectory "backend.quarantine-fixed.json"
+                    New-Item -ItemType Directory -Path $external -Force | Out-Null
+                    New-Item -ItemType Junction -Path $quarantineTarget -Target $external | Out-Null
+                    Assert-TestRequiresJunction -Path $quarantineTarget
+                    $stopScriptPath = (Get-StopScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $escapedPath = $path.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$stopScriptPath'
+`$provider = { param(`$StateDirectoryPath, `$StateLeaf) return (Join-Path `$StateDirectoryPath 'backend.quarantine-fixed.json') }
+try {
+    Remove-StopStateRecord -RootPath '$escapedFixture' -StatePath '$escapedPath' -QuarantinePathProvider `$provider
+    throw 'Expected quarantine reparse refusal.'
+} catch {
+    `$_.Exception.Message
+}
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Contains -ExpectedSubstring "reparse point" -Actual $result.StdOut.ToLowerInvariant() -Message "Quarantine junction refusal should mention reparse points."
+                    Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) -Message "Quarantine junction refusal should preserve the original record."
+                } finally {
+                    Remove-TempFixture -Path $external
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Stop remains idempotent after an injected successful backend stop"
+            Body = {
+                $fixture = New-StopFixture
+                $child = $null
+                try {
+                    $child = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-STOP-IDEMPOTENT"
+                    $actualIdentity = New-StopSyntheticActualIdentity -Child $child
+                    $record = New-StopRecordFromSyntheticIdentity -Child $child -ActualIdentity $actualIdentity
+                    $path = Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $record
+                    $stopScriptPath = (Get-StopScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $escapedExecutablePath = ([string]$actualIdentity.ExecutablePath).Replace("'", "''")
+                    $escapedCommandLine = ([string]$actualIdentity.CommandLine).Replace("'", "''")
+                    $startTimeText = ([datetime]$actualIdentity.StartTimeUtc).ToString("o")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$stopScriptPath'
+`$actualIdentity = [pscustomobject]@{
+    Pid = $($actualIdentity.Pid)
+    ExecutablePath = '$escapedExecutablePath'
+    StartTimeUtc = [datetime]::Parse('$startTimeText', [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    CommandLine = '$escapedCommandLine'
+}
+`$identityProvider = { param(`$ProcessHandle) `$actualIdentity }.GetNewClosure()
+`$identityComparer = {
+    param(`$RecordedIdentity, `$ProcessHandle, `$ActualIdentity)
+    if ([int]`$RecordedIdentity.Pid -ne [int]`$ActualIdentity.Pid) { return `$false }
+    if (-not ([System.IO.Path]::GetFullPath([string]`$RecordedIdentity.ExecutablePath)).Equals([System.IO.Path]::GetFullPath([string]`$ActualIdentity.ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) { return `$false }
+    `$recordedStart = [datetime]::Parse([string]`$RecordedIdentity.StartTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    `$actualStart = ([datetime]`$ActualIdentity.StartTimeUtc).ToUniversalTime()
+    if (`$recordedStart -ne `$actualStart) { return `$false }
+    return ([string]`$RecordedIdentity.CommandLine).Equals([string]`$ActualIdentity.CommandLine, [System.StringComparison]::Ordinal)
+}.GetNewClosure()
+`$first = Stop-ManagedRole -RootPath '$escapedFixture' -Role backend -TimeoutSeconds 5 -IdentityProvider `$identityProvider -IdentityComparer `$identityComparer
+[ordered]@{
+    Success = [bool]`$first.Success
+    Message = [string]`$first.Message
+} | ConvertTo-Json -Compress
+"@
+                    $first = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $firstState = $first.StdOut | ConvertFrom-Json
+                    Assert-True -Condition ([bool]$firstState.Success) -Message "Injected first stop should succeed."
+                    Assert-False -Condition (Test-Path -LiteralPath $path) -Message "First stop should remove the backend record."
+
+                    $second = Invoke-StopScriptProcess -ProjectRoot $fixture -ArgumentList @("-TimeoutSeconds", "5")
+                    Assert-Equal -Expected 0 -Actual $second.ExitCode -Message "Second stop should also succeed."
+                    Assert-Contains -ExpectedSubstring "backend" -Actual $second.StdOut.ToLowerInvariant() -Message "Second stop output should mention backend."
+                    Assert-Contains -ExpectedSubstring "no state record" -Actual $second.StdOut.ToLowerInvariant() -Message "Second stop should report the missing backend record."
+                    Assert-False -Condition (($first.StdOut + $first.StdErr + $second.StdOut + $second.StdErr).Contains("SENTINEL-STOP-IDEMPOTENT")) -Message "Idempotent stop output leaked a secret."
+                } finally {
+                    Stop-StopTestChildProcess -Child $child
                     Remove-TempFixture -Path $fixture
                 }
             }
