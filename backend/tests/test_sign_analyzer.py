@@ -236,6 +236,8 @@ def test_task_list_and_detail_are_scoped_to_authenticated_user(
     assert detail.json()["data"]["task"]["model_family"] == "tt100k-detector"
     persisted_result = detail.json()["data"]["results"][0]
     assert persisted_result["class_name"] == "pl60"
+    assert persisted_result["class_name_cn"] == "最高限速 60 km/h"
+    assert persisted_result["display_name"] == "最高限速 60 km/h"
     assert persisted_result["recognition_mode"] == "detect"
     assert persisted_result["result_type"] == "detection"
     assert persisted_result["dataset"] == "tt100k"
@@ -269,3 +271,59 @@ def test_persisted_classifier_result_exposes_routing_metadata():
     assert payload["result_type"] == "classification"
     assert payload["dataset"] == "gtsrb"
     assert payload["model_family"] == "gtsrb-classifier"
+    assert payload["display_name"] == payload["class_name_cn"]
+
+
+def test_persisted_tt100k_result_derives_missing_chinese_name():
+    result = SimpleNamespace(
+        id=1,
+        task_id=2,
+        task=SimpleNamespace(
+            model_version=SimpleNamespace(model_type="yolov11s")
+        ),
+        image_path="00000.png",
+        annotated_image_url="/uploads/detections/2/0000_00000.jpg",
+        class_name="p23",
+        class_name_cn=None,
+        class_id=12,
+        confidence=1.0,
+        bbox=[0.0, 0.0, 48.0, 48.0],
+        inference_time=2.0,
+        image_width=48,
+        image_height=48,
+        created_at=None,
+    )
+
+    payload = sign_analyzer._result_payload(result)
+
+    assert payload["class_name"] == "p23"
+    assert payload["class_name_cn"] == "禁止向左转弯"
+    assert payload["display_name"] == "禁止向左转弯"
+    assert payload["dataset"] == "tt100k"
+
+
+def test_persisted_tt100k_result_falls_back_to_raw_class_name():
+    result = SimpleNamespace(
+        id=1,
+        task_id=2,
+        task=SimpleNamespace(
+            model_version=SimpleNamespace(model_type="yolov11s")
+        ),
+        image_path="00000.png",
+        annotated_image_url="/uploads/detections/2/0000_00000.jpg",
+        class_name="unknown-code",
+        class_name_cn=None,
+        class_id=12,
+        confidence=1.0,
+        bbox=[0.0, 0.0, 48.0, 48.0],
+        inference_time=2.0,
+        image_width=48,
+        image_height=48,
+        created_at=None,
+    )
+
+    payload = sign_analyzer._result_payload(result)
+
+    assert payload["class_name"] == "unknown-code"
+    assert payload["class_name_cn"] is None
+    assert payload["display_name"] == "unknown-code"

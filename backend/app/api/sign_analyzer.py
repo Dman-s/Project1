@@ -20,6 +20,7 @@ from app.services.detection_task_service import (
 )
 from app.services.file_cache_service import file_cache_service
 from app.services.recognition_router import VALID_MODES
+from app.services.tt100k_labels import tt100k_label_zh
 from app.services.yolo_detector import ModelUnavailableError
 
 router = APIRouter(prefix="/api/sign-analyzer", tags=["交通标志识别"])
@@ -173,22 +174,27 @@ def _task_payload(task) -> dict:
 
 def _result_payload(result) -> dict:
     model_version = result.task.model_version if result.task else None
+    metadata = _recognition_metadata(
+        model_version.model_type if model_version else None
+    )
+    class_name_cn = result.class_name_cn
+    if not class_name_cn and metadata["dataset"] == "tt100k":
+        class_name_cn = tt100k_label_zh(result.class_name)
     return {
         "id": result.id,
         "task_id": result.task_id,
         "image_path": result.image_path,
         "annotated_image_url": result.annotated_image_url,
         "class_name": result.class_name,
-        "class_name_cn": result.class_name_cn,
+        "class_name_cn": class_name_cn,
+        "display_name": class_name_cn or result.class_name,
         "class_id": result.class_id,
         "confidence": result.confidence,
         "bbox": result.bbox,
         "inference_time": result.inference_time,
         "image_width": result.image_width,
         "image_height": result.image_height,
-        **_recognition_metadata(
-            model_version.model_type if model_version else None
-        ),
+        **metadata,
         "created_at": result.created_at,
     }
 
