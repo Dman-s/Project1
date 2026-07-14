@@ -30,7 +30,8 @@ describe("SignDetectionResult", () => {
 
     expect(html).toContain("/uploads/detections/7/road.jpg");
     expect(html).toContain("road.jpg");
-    expect(html).toContain("pl60");
+    expect(html).toContain("最高限速 60 km/h");
+    expect(html).not.toContain(">pl60<");
     expect(html).toContain("91%");
     expect(html).toContain("broken.jpg");
     expect(html).toContain("Unable to decode uploaded image");

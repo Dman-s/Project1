@@ -20,7 +20,8 @@ describe("formatSignResult", () => {
     });
 
     expect(summary).toContain("任务 ID：7");
-    expect(summary).toContain("pl60");
+    expect(summary).toContain("最高限速 60 km/h");
+    expect(summary).not.toContain("- pl60：");
     expect(summary).toContain("91%");
     expect(summary).not.toContain("模拟");
   });

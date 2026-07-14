@@ -1,4 +1,5 @@
 import { AlertCircle, CheckCircle2, ImageOff } from 'lucide-react'
+import { getSignDisplayName } from '../utils/tt100kLabels'
 
 export function SignDetectionResult({ data }) {
   const results = data?.results || []
@@ -56,7 +57,7 @@ export function SignDetectionResult({ data }) {
                   <ul className="space-y-2">
                     {signs.map((sign, signIndex) => (
                       <li key={`${sign.type || sign.class_name}-${signIndex}`} className="flex items-center justify-between gap-3 rounded-md bg-dark-800 px-3 py-2 text-sm">
-                        <span>{sign.display_name || sign.class_name || sign.type || 'unknown'}</span>
+                        <span>{getSignDisplayName(sign)}</span>
                         <span className="text-accent-300">{sign.confidence ?? 0}%</span>
                       </li>
                     ))}

@@ -1,3 +1,5 @@
+import { getSignDisplayName } from './tt100kLabels'
+
 export function formatSignResult(data) {
   if (!data) return '识别完成'
 
@@ -25,7 +27,7 @@ export function formatSignResult(data) {
       if (!image.traffic_signs?.length) return
       result += `\n图片 ${image.filename || index + 1}：\n`
       image.traffic_signs.forEach((sign) => {
-        const label = sign.display_name || sign.class_name || sign.type || 'unknown'
+        const label = getSignDisplayName(sign)
         result += `- ${label}：${sign.value || '无'}，置信度 ${sign.confidence ?? 0}%\n`
       })
     })
