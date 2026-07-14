@@ -294,3 +294,32 @@ def test_detector_uses_sahi_for_sliced_canonical_predictions(tmp_path):
     assert prediction.detections[0].class_id == 29
     assert prediction.detections[0].class_name == "pl60"
     assert prediction.annotated_jpeg.startswith(b"\xff\xd8")
+
+
+def test_realtime_prediction_bypasses_sahi_and_can_force_cpu(tmp_path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    sahi_model = FakeSahiModel()
+    sliced_calls = []
+    detector = LocalYoloDetector(
+        model_path=model_path,
+        device="auto",
+        cuda_available=lambda: True,
+        use_sahi=True,
+        sahi_model_factory=lambda **_kwargs: sahi_model,
+        sliced_predictor=lambda **kwargs: sliced_calls.append(kwargs),
+    )
+
+    prediction = detector.predict_realtime(
+        make_jpeg(),
+        confidence=0.4,
+        iou=0.5,
+        image_size=416,
+        device="cpu",
+    )
+
+    assert sliced_calls == []
+    assert prediction.detections[0].class_name == "pl60"
+    assert len(sahi_model.model.calls) == 1
+    assert sahi_model.model.calls[0]["device"] == "cpu"
+    assert sahi_model.model.calls[0]["imgsz"] == 416

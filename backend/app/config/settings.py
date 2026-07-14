@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
     YOLO_MAX_BATCH_IMAGES: int = Field(default=20, ge=1)
     YOLO_MAX_IMAGE_BYTES: int = Field(default=10 * 1024 * 1024, ge=1)
+    VIDEO_MAX_BYTES: int = Field(default=50 * 1024 * 1024, ge=1)
+    VIDEO_FRAME_SAMPLE_RATE: int = Field(default=5, ge=1)
+    VIDEO_MAX_FRAMES: int = Field(default=50, ge=1)
+    VIDEO_WORKERS: int = Field(default=2, ge=1, le=8)
+    VIDEO_TEMP_DIR: str = "./uploads/videos"
+    CAMERA_CPU_IMAGE_SIZE: int = Field(default=416, ge=32)
+    CAMERA_GPU_IMAGE_SIZE: int = Field(default=640, ge=32)
+    CAMERA_MAX_FRAME_BYTES: int = Field(default=2 * 1024 * 1024, ge=1)
     GTSRB_MODEL_PATH: str = "../training/runs/gtsrb_yolo11n_cls_gpu_final/weights/best.pt"
     GTSRB_DEVICE: str = "auto"
     GTSRB_IMAGE_SIZE: int = Field(default=128, ge=32)
@@ -79,6 +87,10 @@ class Settings(BaseSettings):
     @property
     def detection_output_path(self) -> Path:
         return self._resolve_backend_path(self.DETECTION_OUTPUT_DIR)
+
+    @property
+    def video_temp_path(self) -> Path:
+        return self._resolve_backend_path(self.VIDEO_TEMP_DIR)
 
     # ── Redis 配置 ────────────────────────────────────
     REDIS_HOST: str = "localhost"

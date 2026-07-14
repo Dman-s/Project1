@@ -225,34 +225,86 @@ class LocalYoloDetector:
         with self._lock:
             if self.use_sahi:
                 return self._predict_sahi_locked(image, confidence)
-            model = self._get_model_locked()
-            try:
-                results = model.predict(
-                    source=image,
-                    conf=confidence,
-                    iou=iou,
-                    imgsz=image_size,
-                    device=self.selected_device,
-                    verbose=False,
-                )
-            except Exception as exc:
-                raise ModelUnavailableError(f"YOLO inference failed: {exc}") from exc
+            return self._predict_standard_locked(
+                image,
+                confidence=confidence,
+                iou=iou,
+                image_size=image_size,
+                device=self.selected_device,
+            )
 
-            if not results:
-                raise ModelUnavailableError("YOLO inference returned no image result")
+    def predict_realtime(
+        self,
+        image_bytes: bytes,
+        confidence: float = 0.25,
+        iou: float = 0.45,
+        image_size: int = 640,
+        device: str | None = None,
+    ) -> ImagePrediction:
+        """Run whole-frame YOLO inference for video and camera workloads."""
+        image = self._decode_image(image_bytes)
+        resolved_device = self.selected_device if device is None else str(device)
+        if resolved_device != "cpu" and not self._cuda_available():
+            raise ModelUnavailableError(
+                f"CUDA device {resolved_device} was requested but CUDA is unavailable"
+            )
+        with self._lock:
+            return self._predict_standard_locked(
+                image,
+                confidence=confidence,
+                iou=iou,
+                image_size=image_size,
+                device=resolved_device,
+            )
 
-            result = results[0]
-            detections = self._convert_detections(result)
-            annotated_jpeg = self._encode_annotated_image(result.plot())
+    def warmup_realtime(self, *, image_size: int, device: str) -> None:
+        """Load the model and execute one small whole-frame prediction."""
+        output = BytesIO()
+        Image.new("RGB", (64, 64), color="black").save(output, format="JPEG")
+        self.predict_realtime(
+            output.getvalue(),
+            confidence=0.25,
+            iou=0.45,
+            image_size=image_size,
+            device=device,
+        )
 
+    def _predict_standard_locked(
+        self,
+        image: Image.Image,
+        *,
+        confidence: float,
+        iou: float,
+        image_size: int,
+        device: str,
+    ) -> ImagePrediction:
+        model = self._get_model_locked()
+        try:
+            results = model.predict(
+                source=image,
+                conf=confidence,
+                iou=iou,
+                imgsz=image_size,
+                device=device,
+                verbose=False,
+            )
+        except Exception as exc:
+            raise ModelUnavailableError(f"YOLO inference failed: {exc}") from exc
+
+        if not results:
+            raise ModelUnavailableError("YOLO inference returned no image result")
+
+        result = results[0]
+        detections = self._convert_detections(result)
         height, width = getattr(result, "orig_shape", (image.height, image.width))
-        inference_time_ms = float(getattr(result, "speed", {}).get("inference", 0.0))
         return ImagePrediction(
             width=int(width),
             height=int(height),
-            inference_time_ms=inference_time_ms,
+            inference_time_ms=float(
+                getattr(result, "speed", {}).get("inference", 0.0)
+            ),
             detections=detections,
-            annotated_jpeg=annotated_jpeg,
+            annotated_jpeg=self._encode_annotated_image(result.plot()),
         )
 
     def _predict_sahi_locked(
