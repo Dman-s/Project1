@@ -9,6 +9,10 @@ from app.services.yolo_detector import (
     LocalYoloDetector,
     ModelUnavailableError,
 )
+from app.services.tt100k_labels import (
+    TT100K_COMMON_45_CLASSES,
+    build_tt100k_class_id_map,
+)
 
 
 class FakeTensor:
@@ -48,6 +52,39 @@ class FakeModel:
     def predict(self, **kwargs):
         self.calls.append(kwargs)
         return [FakeResult()]
+
+
+class FakeSahiBbox:
+    @staticmethod
+    def to_xyxy():
+        return [3.0, 4.0, 21.0, 23.0]
+
+
+class FakeSahiScore:
+    value = 0.93
+
+
+class FakeSahiCategory:
+    id = 1
+    name = "pl60"
+
+
+class FakeSahiObjectPrediction:
+    bbox = FakeSahiBbox()
+    score = FakeSahiScore()
+    category = FakeSahiCategory()
+
+
+class FakeSahiPredictionResult:
+    object_prediction_list = [FakeSahiObjectPrediction()]
+    durations_in_seconds = {"prediction": 0.125}
+
+
+class FakeSahiModel:
+    def __init__(self):
+        self.model = FakeModel()
+        self.confidence_threshold = None
+        self.image_size = None
 
 
 def make_jpeg(width=32, height=24):
@@ -157,3 +194,103 @@ def test_detector_rejects_corrupt_image_without_running_model(tmp_path):
         detector.predict(b"not-an-image")
 
     assert model.calls == []
+
+
+def test_reference_42_class_names_map_to_canonical_45_ids():
+    reference_names = (
+        "i2", "i4", "i5", "il100", "i160", "il80", "io", "ip",
+        "p10", "p11", "p12", "p19", "p23", "p26", "p27", "p3",
+        "p5", "p\u00f3", "pg", "ph4", "ph4.5", "pl100", "pl120",
+        "pl20", "pl30", "pl40", "pl5", "pl50", "pl60", "pl70",
+        "pL80", "pm20", "pm30", "pm55", "pn", "pne", "po",
+        "pr40", "w13", "w55", "w57", "w59",
+    )
+
+    mapping = build_tt100k_class_id_map(dict(enumerate(reference_names)))
+
+    assert mapping[4] == 4
+    assert mapping[17] == 17
+    assert mapping[21] == 22
+    assert mapping[28] == 29
+    assert mapping[39] == 41
+    assert mapping[41] == 43
+
+
+def test_detector_canonicalizes_reference_model_predictions(tmp_path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    native_names = {0: "p10", 1: "pl60"}
+    result = FakeResult()
+    result.names = native_names
+    model = FakeModel()
+    model.names = native_names
+    model.predict = lambda **_kwargs: [result]
+    detector = LocalYoloDetector(
+        model_path=model_path,
+        model_factory=lambda _path: model,
+        canonicalize_tt100k_classes=True,
+    )
+
+    prediction = detector.predict(make_jpeg())
+
+    assert len(detector.class_names) == 45
+    assert detector.class_names[29] == "pl60"
+    assert prediction.detections[0].class_id == 29
+    assert prediction.detections[0].class_name == "pl60"
+    assert tuple(detector.class_names.values()) == TT100K_COMMON_45_CLASSES
+
+
+def test_detector_uses_sahi_for_sliced_canonical_predictions(tmp_path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    sahi_model = FakeSahiModel()
+    factory_calls = []
+    prediction_calls = []
+
+    def sahi_model_factory(**kwargs):
+        factory_calls.append(kwargs)
+        return sahi_model
+
+    def sliced_predictor(**kwargs):
+        prediction_calls.append(kwargs)
+        return FakeSahiPredictionResult()
+
+    detector = LocalYoloDetector(
+        model_path=model_path,
+        device="auto",
+        cuda_available=lambda: True,
+        canonicalize_tt100k_classes=True,
+        use_sahi=True,
+        sahi_slice_height=512,
+        sahi_slice_width=512,
+        sahi_overlap_ratio=0.2,
+        sahi_model_image_size=640,
+        sahi_model_factory=sahi_model_factory,
+        sliced_predictor=sliced_predictor,
+    )
+
+    prediction = detector.predict(
+        make_jpeg(width=64, height=48),
+        confidence=0.5,
+        image_size=1280,
+    )
+
+    assert factory_calls == [
+        {
+            "model_path": str(model_path),
+            "device": "0",
+            "confidence_threshold": 0.5,
+            "image_size": 640,
+        }
+    ]
+    assert prediction_calls[0]["slice_height"] == 512
+    assert prediction_calls[0]["slice_width"] == 512
+    assert prediction_calls[0]["overlap_height_ratio"] == 0.2
+    assert prediction_calls[0]["overlap_width_ratio"] == 0.2
+    assert prediction_calls[0]["perform_standard_pred"] is True
+    assert prediction.width == 64
+    assert prediction.height == 48
+    assert prediction.inference_time_ms == pytest.approx(125.0)
+    assert prediction.detections[0].class_id == 29
+    assert prediction.detections[0].class_name == "pl60"
+    assert prediction.annotated_jpeg.startswith(b"\xff\xd8")

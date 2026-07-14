@@ -62,6 +62,13 @@ class DetectionTaskService:
         self.detector = detector or LocalYoloDetector(
             model_path=settings.yolo_model_path,
             device=settings.YOLO_DEVICE,
+            canonicalize_tt100k_classes=settings.YOLO_CANONICALIZE_TT100K_CLASSES,
+            use_sahi=settings.YOLO_USE_SAHI,
+            sahi_slice_height=settings.YOLO_SAHI_SLICE_HEIGHT,
+            sahi_slice_width=settings.YOLO_SAHI_SLICE_WIDTH,
+            sahi_overlap_ratio=settings.YOLO_SAHI_OVERLAP_RATIO,
+            sahi_model_image_size=settings.YOLO_SAHI_MODEL_IMAGE_SIZE,
+            sahi_perform_standard_prediction=settings.YOLO_SAHI_STANDARD_PREDICTION,
         )
         self.router = router
         self.output_dir = Path(output_dir or settings.detection_output_path)
@@ -80,8 +87,12 @@ class DetectionTaskService:
             if is_classification
             else self.SCENE_DISPLAY_NAME
         )
-        model_name = "gtsrb-yolo11n-cls" if is_classification else self.MODEL_NAME
-        model_type = "yolo11n-cls" if is_classification else "yolov11n"
+        model_name = (
+            "gtsrb-yolo11n-cls" if is_classification else settings.YOLO_MODEL_NAME
+        )
+        model_type = (
+            "yolo11n-cls" if is_classification else settings.YOLO_MODEL_TYPE
+        )
         class_names = predictor.class_names
         ordered_names = [class_names[key] for key in sorted(class_names)]
 
@@ -143,6 +154,8 @@ class DetectionTaskService:
             )
             db.add(model_version)
         else:
+            model_version.model_name = model_name
+            model_version.model_type = model_type
             model_version.is_default = True
 
         db.commit()
@@ -424,6 +437,13 @@ class DetectionTaskService:
 _default_detector = LocalYoloDetector(
     model_path=settings.yolo_model_path,
     device=settings.YOLO_DEVICE,
+    canonicalize_tt100k_classes=settings.YOLO_CANONICALIZE_TT100K_CLASSES,
+    use_sahi=settings.YOLO_USE_SAHI,
+    sahi_slice_height=settings.YOLO_SAHI_SLICE_HEIGHT,
+    sahi_slice_width=settings.YOLO_SAHI_SLICE_WIDTH,
+    sahi_overlap_ratio=settings.YOLO_SAHI_OVERLAP_RATIO,
+    sahi_model_image_size=settings.YOLO_SAHI_MODEL_IMAGE_SIZE,
+    sahi_perform_standard_prediction=settings.YOLO_SAHI_STANDARD_PREDICTION,
 )
 _default_classifier = LocalSignClassifier(
     model_path=settings.gtsrb_model_path,

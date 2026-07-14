@@ -26,7 +26,16 @@ class Settings(BaseSettings):
     MINIO_ENABLED: bool | None = None
     # ── 本地 YOLO 推理配置 ────────────────────────────
     YOLO_MODEL_PATH: str = "../training/runs/tt100k_yolo11n_gpu/weights/best.pt"
+    YOLO_MODEL_NAME: str = "tt100k-yolo11n"
+    YOLO_MODEL_TYPE: str = "yolov11n"
     YOLO_DEVICE: str = "auto"
+    YOLO_CANONICALIZE_TT100K_CLASSES: bool = True
+    YOLO_USE_SAHI: bool = False
+    YOLO_SAHI_SLICE_HEIGHT: int = Field(default=512, ge=128)
+    YOLO_SAHI_SLICE_WIDTH: int = Field(default=512, ge=128)
+    YOLO_SAHI_OVERLAP_RATIO: float = Field(default=0.2, ge=0.0, lt=1.0)
+    YOLO_SAHI_MODEL_IMAGE_SIZE: int = Field(default=640, ge=32)
+    YOLO_SAHI_STANDARD_PREDICTION: bool = True
     YOLO_CONFIDENCE: float = Field(default=0.25, ge=0.0, le=1.0)
     YOLO_IOU: float = Field(default=0.45, ge=0.0, le=1.0)
     YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
