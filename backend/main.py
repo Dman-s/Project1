@@ -42,12 +42,16 @@ async def lifespan(_app: FastAPI):
     
     from app.services.scheduler_service import scheduler_service
     scheduler_service.start()
+
+    from app.services.video_detection_service import video_detection_service
+
+    migrated_sidecars = video_detection_service.migrate_legacy_sidecars()
+    if migrated_sidecars:
+        print(f"已迁移 {migrated_sidecars} 个旧视频状态文件")
     
     yield
     # 关闭时执行
     scheduler_service.shutdown()
-    from app.services.video_detection_service import video_detection_service
-
     video_detection_service.shutdown()
     print("服务已关闭")
 

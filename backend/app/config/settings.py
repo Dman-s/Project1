@@ -9,7 +9,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 class Settings(BaseSettings):
     # ── 应用基础配置 ──────────────────────────────────
-    APP_NAME: str = "111"
+    APP_NAME: str = "RSOD Agent Platform"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"

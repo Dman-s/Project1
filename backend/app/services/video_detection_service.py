@@ -224,23 +224,31 @@ class VideoDetectionService:
                     "Unable to hand video task %s to the executor",
                     task_id,
                 )
-            db.rollback()
-            failed_task = db.get(DetectionTask, task_id)
-            if failed_task is not None:
-                failed_task.status = "failed"
-                failed_task.error_message = public_error
-                failed_task.completed_at = datetime.now()
-                db.commit()
-            if progress_created:
-                self.progress.update(
+            try:
+                db.rollback()
+                failed_task = db.get(DetectionTask, task_id)
+                if failed_task is not None:
+                    failed_task.status = "failed"
+                    failed_task.error_message = public_error
+                    failed_task.completed_at = datetime.now()
+                    db.commit()
+            except Exception:
+                logger.exception(
+                    "Unable to persist submission failure for video task %s",
                     task_id,
-                    status="failed",
-                    progress=100,
-                    error=public_error,
                 )
-                self._persist_terminal_state_safely(task_id)
-            if source_dir is not None:
-                shutil.rmtree(source_dir, ignore_errors=True)
+            try:
+                if progress_created:
+                    self.progress.update(
+                        task_id,
+                        status="failed",
+                        progress=100,
+                        error=public_error,
+                    )
+                    self._persist_terminal_state_safely(task_id)
+            finally:
+                if source_dir is not None:
+                    shutil.rmtree(source_dir, ignore_errors=True)
             if isinstance(exc, VideoProcessingError):
                 raise
             raise VideoProcessingError(public_error) from exc
@@ -494,6 +502,35 @@ class VideoDetectionService:
         except (OSError, ValueError):
             logger.exception("Unable to read video status sidecar for task %s", task_id)
             return None
+
+    def migrate_legacy_sidecars(self) -> int:
+        """Move status JSON out of the public uploads tree during upgrades."""
+        self.status_dir.mkdir(parents=True, exist_ok=True)
+        migrated = 0
+        for legacy_path in self.output_dir.glob("*/video_status.json"):
+            task_name = legacy_path.parent.name
+            if not task_name.isdigit():
+                logger.warning("Removing unexpected public video sidecar %s", legacy_path)
+                legacy_path.unlink(missing_ok=True)
+                continue
+            target_path = self.status_dir / f"{task_name}.json"
+            try:
+                if target_path.exists():
+                    legacy_path.unlink()
+                else:
+                    legacy_path.replace(target_path)
+                migrated += 1
+            except OSError:
+                logger.exception("Unable to migrate legacy sidecar %s", legacy_path)
+        for temporary_path in self.output_dir.glob("*/video_status.json.tmp"):
+            try:
+                temporary_path.unlink()
+            except OSError:
+                logger.exception(
+                    "Unable to remove legacy temporary sidecar %s",
+                    temporary_path,
+                )
+        return migrated
 
     @staticmethod
     def _planned_source_frames(

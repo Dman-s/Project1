@@ -64,6 +64,22 @@ class FailingExecutor:
         return None
 
 
+class CompensationCommitFailingSession:
+    def __init__(self, session, fail_on_commit):
+        self.session = session
+        self.fail_on_commit = fail_on_commit
+        self.commit_count = 0
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
+    def commit(self):
+        self.commit_count += 1
+        if self.commit_count == self.fail_on_commit:
+            raise RuntimeError("database unavailable during compensation")
+        return self.session.commit()
+
+
 class FakeCapture:
     def __init__(self, frames, opened=True, fps=10.0):
         self.frames = list(frames)
@@ -453,3 +469,50 @@ def test_executor_submission_failure_marks_task_failed_and_cleans_files(
     assert task.status == "failed"
     assert task.error_message == "无法创建视频检测任务，请稍后重试"
     assert list((tmp_path / "videos").glob("**/*")) == []
+
+
+def test_compensation_database_failure_still_cleans_source_files(
+    db_session, tmp_path
+):
+    user = create_user(db_session, "video_compensation_failure_user")
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)]),
+        executor=FailingExecutor(),
+    )
+    failing_db = CompensationCommitFailingSession(db_session, fail_on_commit=3)
+
+    with pytest.raises(Exception, match="无法创建视频检测任务"):
+        service.submit(
+            db=failing_db,
+            user_id=user.id,
+            filename="road.mp4",
+            content=b"video",
+            confidence=0.25,
+            iou=0.45,
+            image_size=640,
+            sample_rate=1,
+            max_frames=1,
+        )
+
+    assert list((tmp_path / "videos").glob("**/*")) == []
+
+
+def test_migrates_legacy_public_sidecars_to_private_directory(
+    db_session, tmp_path
+):
+    capture = FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)])
+    service, _detector = build_service(db_session, tmp_path, capture)
+    legacy_dir = tmp_path / "detections" / "123"
+    legacy_dir.mkdir(parents=True)
+    legacy = legacy_dir / "video_status.json"
+    legacy.write_text('{"task_id":123,"status":"completed"}', encoding="utf-8")
+
+    migrated = service.migrate_legacy_sidecars()
+
+    assert migrated == 1
+    assert not legacy.exists()
+    assert (
+        tmp_path / "video-status" / "123.json"
+    ).read_text(encoding="utf-8") == '{"task_id":123,"status":"completed"}'
