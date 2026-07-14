@@ -128,7 +128,7 @@ class DetectionTaskService:
         else:
             if scene.class_names != ordered_names:
                 scene.class_names = ordered_names
-            if scene.class_names_cn != class_names_cn:
+            if not is_classification and scene.class_names_cn != class_names_cn:
                 scene.class_names_cn = class_names_cn
 
         model_path = str(predictor.model_path)

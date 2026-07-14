@@ -162,6 +162,32 @@ def test_detector_scene_labels_only_include_active_classes(db_session, tmp_path)
     }
 
 
+def test_ensure_registry_preserves_existing_classification_scene_labels(
+    db_session, tmp_path
+):
+    service = DetectionTaskService(output_dir=tmp_path)
+
+    scene, _ = service.ensure_registry(
+        db_session,
+        predictor=FakeClassifier(),
+        recognition_mode="classify",
+    )
+    scene.class_names_cn = {"legacy": "保留"}
+    db_session.commit()
+
+    refreshed_scene, _ = service.ensure_registry(
+        db_session,
+        predictor=FakeClassifier(),
+        recognition_mode="classify",
+    )
+
+    assert refreshed_scene.id == scene.id
+    assert refreshed_scene.class_names == [
+        "Vehicles over 3.5 metric tons prohibited"
+    ]
+    assert refreshed_scene.class_names_cn == {"legacy": "保留"}
+
+
 def test_ensure_registry_repairs_stale_detector_scene_labels(db_session, tmp_path):
     service = DetectionTaskService(detector=FakeDetector(), output_dir=tmp_path)
     scene, _ = service.ensure_registry(db_session)

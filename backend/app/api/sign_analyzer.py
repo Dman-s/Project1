@@ -178,7 +178,7 @@ def _result_payload(result) -> dict:
         model_version.model_type if model_version else None
     )
     class_name_cn = result.class_name_cn
-    if not class_name_cn and metadata["dataset"] == "tt100k":
+    if not class_name_cn:
         class_name_cn = tt100k_label_zh(result.class_name)
     return {
         "id": result.id,

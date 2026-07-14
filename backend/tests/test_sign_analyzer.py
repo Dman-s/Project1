@@ -274,6 +274,64 @@ def test_persisted_classifier_result_exposes_routing_metadata():
     assert payload["display_name"] == payload["class_name_cn"]
 
 
+def test_persisted_classifier_result_derives_missing_chinese_name_from_tt100k_lookup():
+    result = SimpleNamespace(
+        id=1,
+        task_id=2,
+        task=SimpleNamespace(
+            model_version=SimpleNamespace(model_type="yolo11n-cls")
+        ),
+        image_path="00000.png",
+        annotated_image_url="/uploads/detections/2/0000_00000.jpg",
+        class_name="p23",
+        class_name_cn=None,
+        class_id=16,
+        confidence=1.0,
+        bbox=[0.0, 0.0, 48.0, 48.0],
+        inference_time=2.0,
+        image_width=48,
+        image_height=48,
+        created_at=None,
+    )
+
+    payload = sign_analyzer._result_payload(result)
+
+    assert payload["recognition_mode"] == "classify"
+    assert payload["result_type"] == "classification"
+    assert payload["dataset"] == "gtsrb"
+    assert payload["model_family"] == "gtsrb-classifier"
+    assert payload["class_name"] == "p23"
+    assert payload["class_name_cn"] == "禁止向左转弯"
+    assert payload["display_name"] == "禁止向左转弯"
+
+
+def test_persisted_classifier_result_preserves_existing_chinese_name_for_unknown_code():
+    result = SimpleNamespace(
+        id=1,
+        task_id=2,
+        task=SimpleNamespace(
+            model_version=SimpleNamespace(model_type="yolo11n-cls")
+        ),
+        image_path="00000.png",
+        annotated_image_url="/uploads/detections/2/0000_00000.jpg",
+        class_name="unknown-code",
+        class_name_cn="保持原文",
+        class_id=16,
+        confidence=1.0,
+        bbox=[0.0, 0.0, 48.0, 48.0],
+        inference_time=2.0,
+        image_width=48,
+        image_height=48,
+        created_at=None,
+    )
+
+    payload = sign_analyzer._result_payload(result)
+
+    assert payload["class_name_cn"] == "保持原文"
+    assert payload["display_name"] == "保持原文"
+    assert payload["dataset"] == "gtsrb"
+
+
 def test_persisted_tt100k_result_derives_missing_chinese_name():
     result = SimpleNamespace(
         id=1,
