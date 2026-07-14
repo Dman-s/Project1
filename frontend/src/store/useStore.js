@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { formatSignResult } from '../utils/signResults'
+import { pollVideoStatus, uploadVideo } from '../api/detection'
 
 const API_BASE = '/api'
 
@@ -376,6 +377,95 @@ export const useStore = create((set, get) => ({
     }
   },
 
+  detectVideo: async (conversationId, file, options = {}) => {
+    conversationId = await get().ensureConversationPersisted(conversationId)
+    const now = Date.now()
+    const resultMessageId = `video-result-${now}`
+    const initialData = {
+      filename: file.name,
+      status: 'pending',
+      progress: 0,
+      processed_frames: 0,
+      sampled_frames: 0,
+      key_frames: [],
+    }
+    const updateResult = (resultData) => {
+      set((state) => ({
+        conversations: state.conversations.map((conversation) =>
+          conversation.id === conversationId
+            ? {
+                ...conversation,
+                messages: conversation.messages.map((message) =>
+                  message.id === resultMessageId
+                    ? {
+                        ...message,
+                        resultData: {
+                          ...message.resultData,
+                          ...resultData,
+                          filename: resultData.filename || file.name,
+                        },
+                      }
+                    : message,
+                ),
+              }
+            : conversation,
+        ),
+      }))
+    }
+
+    set((state) => ({
+      conversations: state.conversations.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              title: conversation.messages.length === 0
+                ? '视频交通标志检测'
+                : conversation.title,
+              messages: [
+                ...conversation.messages,
+                {
+                  id: `video-user-${now}`,
+                  conversationId,
+                  role: 'user',
+                  content: `上传视频：${file.name}`,
+                  createdAt: new Date(),
+                },
+                {
+                  id: resultMessageId,
+                  conversationId,
+                  role: 'assistant',
+                  content: '视频检测处理中',
+                  createdAt: new Date(),
+                  type: 'video_result',
+                  resultData: initialData,
+                },
+              ],
+            }
+          : conversation,
+      ),
+    }))
+
+    try {
+      const submission = await uploadVideo(file, options)
+      updateResult({ ...submission, filename: file.name })
+      const result = await pollVideoStatus(submission.task_id, {
+        onProgress: updateResult,
+      })
+      updateResult(result)
+      await get().saveMessage(conversationId, 'user', `上传视频：${file.name}`)
+      await get().saveMessage(
+        conversationId,
+        'assistant',
+        `视频检测完成：${result.total_objects || 0} 个交通标志，${result.key_frames?.length || 0} 个关键帧`,
+      )
+      return result
+    } catch (error) {
+      updateResult({ status: 'failed', error: error.message })
+      get().setError(error.message)
+      throw error
+    }
+  },
+
   addConversation: async () => {
     try {
       const data = await request(`/chat-sessions?title=${encodeURIComponent('New Chat')}`, {
@@ -495,6 +585,31 @@ export const useStore = create((set, get) => ({
     conversationId = await get().ensureConversationPersisted(conversationId)
     const trimmedContent = content.trim().toLowerCase()
     
+    if (trimmedContent.includes('视频检测') || trimmedContent.includes('视频识别')) {
+      const uploadMessage = {
+        id: Date.now().toString(),
+        conversationId,
+        role: 'assistant',
+        content: '',
+        createdAt: new Date(),
+        type: 'video_upload',
+      }
+      set((state) => ({
+        conversations: state.conversations.map((conversation) =>
+          conversation.id === conversationId
+            ? {
+                ...conversation,
+                messages: [...conversation.messages, uploadMessage],
+                title: conversation.messages.length === 0
+                  ? '视频交通标志检测'
+                  : conversation.title,
+              }
+            : conversation,
+        ),
+      }))
+      return
+    }
+
     if (trimmedContent.includes('标志识别') || trimmedContent.includes('交通标志') || trimmedContent.includes('信号灯')) {
       const uploadMessage = {
         id: Date.now().toString(),
