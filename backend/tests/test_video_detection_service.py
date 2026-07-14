@@ -13,6 +13,7 @@ from app.services.video_detection_service import (
     VideoDetectionService,
     VideoProgressRegistry,
     VideoQueueFullError,
+    VideoStatusMigrationError,
 )
 from app.services.yolo_detector import (
     DetectedObject,
@@ -516,3 +517,23 @@ def test_migrates_legacy_public_sidecars_to_private_directory(
     assert (
         tmp_path / "video-status" / "123.json"
     ).read_text(encoding="utf-8") == '{"task_id":123,"status":"completed"}'
+
+
+def test_legacy_sidecar_migration_failure_blocks_startup(
+    db_session, tmp_path, monkeypatch
+):
+    capture = FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)])
+    service, _detector = build_service(db_session, tmp_path, capture)
+    legacy_dir = tmp_path / "detections" / "124"
+    legacy_dir.mkdir(parents=True)
+    legacy = legacy_dir / "video_status.json"
+    legacy.write_text('{"task_id":124}', encoding="utf-8")
+    monkeypatch.setattr(
+        "app.services.video_detection_service.shutil.move",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("locked")),
+    )
+
+    with pytest.raises(VideoStatusMigrationError):
+        service.migrate_legacy_sidecars()
+
+    assert legacy.exists()

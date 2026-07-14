@@ -34,6 +34,10 @@ class VideoQueueFullError(RuntimeError):
     pass
 
 
+class VideoStatusMigrationError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class VideoTaskSubmission:
     task_id: int
@@ -505,31 +509,45 @@ class VideoDetectionService:
 
     def migrate_legacy_sidecars(self) -> int:
         """Move status JSON out of the public uploads tree during upgrades."""
-        self.status_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.status_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise VideoStatusMigrationError(
+                "无法创建私有视频状态目录，服务已停止启动"
+            ) from exc
         migrated = 0
         for legacy_path in self.output_dir.glob("*/video_status.json"):
             task_name = legacy_path.parent.name
-            if not task_name.isdigit():
-                logger.warning("Removing unexpected public video sidecar %s", legacy_path)
-                legacy_path.unlink(missing_ok=True)
-                continue
-            target_path = self.status_dir / f"{task_name}.json"
             try:
-                if target_path.exists():
-                    legacy_path.unlink()
+                if not task_name.isdigit():
+                    logger.warning(
+                        "Removing unexpected public video sidecar %s",
+                        legacy_path,
+                    )
+                    legacy_path.unlink(missing_ok=True)
                 else:
-                    legacy_path.replace(target_path)
-                migrated += 1
-            except OSError:
+                    target_path = self.status_dir / f"{task_name}.json"
+                    if target_path.exists():
+                        legacy_path.unlink()
+                    else:
+                        shutil.move(str(legacy_path), str(target_path))
+                    migrated += 1
+            except OSError as exc:
                 logger.exception("Unable to migrate legacy sidecar %s", legacy_path)
+                raise VideoStatusMigrationError(
+                    "旧视频状态文件无法移出公开目录，服务已停止启动"
+                ) from exc
         for temporary_path in self.output_dir.glob("*/video_status.json.tmp"):
             try:
                 temporary_path.unlink()
-            except OSError:
+            except OSError as exc:
                 logger.exception(
                     "Unable to remove legacy temporary sidecar %s",
                     temporary_path,
                 )
+                raise VideoStatusMigrationError(
+                    "旧视频临时状态文件无法从公开目录删除，服务已停止启动"
+                ) from exc
         return migrated
 
     @staticmethod
