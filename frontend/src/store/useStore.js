@@ -453,11 +453,19 @@ export const useStore = create((set, get) => ({
       })
       updateResult(result)
       await get().saveMessage(conversationId, 'user', `上传视频：${file.name}`)
-      await get().saveMessage(
-        conversationId,
-        'assistant',
-        `视频检测完成：${result.total_objects || 0} 个交通标志，${result.key_frames?.length || 0} 个关键帧`,
-      )
+      if (result.status === 'failed') {
+        await get().saveMessage(
+          conversationId,
+          'assistant',
+          `视频检测失败：${result.error || '服务未能完成该任务'}`,
+        )
+      } else {
+        await get().saveMessage(
+          conversationId,
+          'assistant',
+          `视频检测完成：${result.total_objects || 0} 个交通标志，${result.key_frames?.length || 0} 个关键帧`,
+        )
+      }
       return result
     } catch (error) {
       updateResult({ status: 'failed', error: error.message })

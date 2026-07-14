@@ -4,12 +4,21 @@ from io import BytesIO
 import cv2
 import numpy as np
 from PIL import Image
+import pytest
 from sqlalchemy.orm import sessionmaker
 
 from app.entity.db_models import DetectionResult, DetectionTask, User
 from app.services.detection_task_service import DetectionTaskService
-from app.services.video_detection_service import VideoDetectionService
-from app.services.yolo_detector import DetectedObject, ImagePrediction
+from app.services.video_detection_service import (
+    VideoDetectionService,
+    VideoProgressRegistry,
+    VideoQueueFullError,
+)
+from app.services.yolo_detector import (
+    DetectedObject,
+    ImagePrediction,
+    ModelUnavailableError,
+)
 
 
 class ImmediateExecutor:
@@ -20,6 +29,31 @@ class ImmediateExecutor:
         except Exception as exc:
             future.set_exception(exc)
         return future
+
+    def shutdown(self, **_kwargs):
+        return None
+
+
+class DeferredExecutor:
+    def __init__(self):
+        self.pending = []
+        self.shutdown_options = None
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        self.pending.append((future, function, args, kwargs))
+        return future
+
+    def run_all(self):
+        for future, function, args, kwargs in list(self.pending):
+            try:
+                future.set_result(function(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+        self.pending.clear()
+
+    def shutdown(self, **options):
+        self.shutdown_options = options
 
 
 class FakeCapture:
@@ -59,11 +93,15 @@ class FakeRealtimeDetector:
     selected_device = "0"
     class_names = {0: "pl60"}
 
-    def __init__(self, model_path):
+    def __init__(self, model_path, detections=True, failure=None):
         self.model_path = model_path
         self.calls = []
+        self.with_detections = detections
+        self.failure = failure
 
     def predict_realtime(self, image_bytes, confidence, iou, image_size, device=None):
+        if self.failure is not None:
+            raise self.failure
         with Image.open(BytesIO(image_bytes)) as image:
             width, height = image.size
         self.calls.append(
@@ -85,7 +123,7 @@ class FakeRealtimeDetector:
                     confidence=0.9,
                     bbox=(1.0, 2.0, 12.0, 14.0),
                 ),
-            ),
+            ) if self.with_detections else (),
             annotated_jpeg=b"annotated-frame",
         )
 
@@ -102,10 +140,24 @@ def create_user(db_session, username):
     return user
 
 
-def build_service(db_session, tmp_path, capture):
+def build_service(
+    db_session,
+    tmp_path,
+    capture,
+    *,
+    executor=None,
+    max_pending_tasks=None,
+    detections=True,
+    failure=None,
+    progress_registry=None,
+):
     model_path = tmp_path / "best.pt"
     model_path.write_bytes(b"checkpoint")
-    detector = FakeRealtimeDetector(model_path)
+    detector = FakeRealtimeDetector(
+        model_path,
+        detections=detections,
+        failure=failure,
+    )
     task_service = DetectionTaskService(
         detector=detector,
         output_dir=tmp_path / "detections",
@@ -118,7 +170,9 @@ def build_service(db_session, tmp_path, capture):
         output_dir=tmp_path / "detections",
         temp_dir=tmp_path / "videos",
         capture_factory=lambda _path: capture,
-        executor=ImmediateExecutor(),
+        executor=executor or ImmediateExecutor(),
+        max_pending_tasks=max_pending_tasks,
+        progress_registry=progress_registry,
     )
     return service, detector
 
@@ -196,3 +250,154 @@ def test_video_task_marks_decode_failure_and_cleans_source(db_session, tmp_path)
     assert "Unable to open video" in status["error"]
     assert capture.released is True
     assert list((tmp_path / "videos").glob("**/*")) == []
+
+
+def test_video_task_rejects_invalid_metadata(db_session, tmp_path):
+    user = create_user(db_session, "video_metadata_user")
+    frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
+    capture = FakeCapture(frames, fps=0)
+    service, _detector = build_service(db_session, tmp_path, capture)
+
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="invalid.mp4",
+        content=b"video",
+        confidence=0.25,
+        iou=0.45,
+        image_size=640,
+        sample_rate=5,
+        max_frames=50,
+    )
+    db_session.expire_all()
+    status = service.get_status(db_session, user.id, submission.task_id)
+
+    assert status["status"] == "failed"
+    assert status["error"] == "视频元数据无效，无法开始检测"
+
+
+def test_video_queue_has_bounded_admission_and_safe_shutdown(db_session, tmp_path):
+    user = create_user(db_session, "video_queue_user")
+    executor = DeferredExecutor()
+    frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture(frames),
+        executor=executor,
+        max_pending_tasks=1,
+    )
+
+    service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="one.mp4",
+        content=b"one",
+        confidence=0.25,
+        iou=0.45,
+        image_size=640,
+        sample_rate=1,
+        max_frames=1,
+    )
+    with pytest.raises(VideoQueueFullError):
+        service.submit(
+            db=db_session,
+            user_id=user.id,
+            filename="two.mp4",
+            content=b"two",
+            confidence=0.25,
+            iou=0.45,
+            image_size=640,
+            sample_rate=1,
+            max_frames=1,
+        )
+    assert db_session.query(DetectionTask).filter(
+        DetectionTask.user_id == user.id
+    ).count() == 1
+
+    executor.run_all()
+    service.shutdown()
+    assert executor.shutdown_options == {"wait": True, "cancel_futures": False}
+
+
+def test_terminal_progress_expires_and_reloads_complete_sidecar(
+    db_session, tmp_path
+):
+    user = create_user(db_session, "video_sidecar_user")
+    clock_value = [10.0]
+    registry = VideoProgressRegistry(ttl_seconds=1, clock=lambda: clock_value[0])
+    frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
+    capture = FakeCapture(frames)
+    service, detector = build_service(
+        db_session,
+        tmp_path,
+        capture,
+        detections=False,
+        progress_registry=registry,
+    )
+
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="empty.mp4",
+        content=b"video",
+        confidence=0.25,
+        iou=0.45,
+        image_size=640,
+        sample_rate=1,
+        max_frames=1,
+    )
+    clock_value[0] = 12.0
+    assert registry.get(submission.task_id) is None
+
+    reloaded = VideoDetectionService(
+        detector=detector,
+        task_service=service.task_service,
+        session_factory=service.session_factory,
+        output_dir=tmp_path / "detections",
+        temp_dir=tmp_path / "videos",
+        capture_factory=lambda _path: capture,
+        executor=ImmediateExecutor(),
+        progress_registry=VideoProgressRegistry(),
+    ).get_status(db_session, user.id, submission.task_id)
+
+    assert reloaded["filename"] == "empty.mp4"
+    assert reloaded["metadata"]["fps"] == 10.0
+    assert len(reloaded["key_frames"]) == 1
+    assert reloaded["key_frames"][0]["traffic_signs"] == []
+
+
+def test_worker_hides_detector_filesystem_errors(db_session, tmp_path):
+    user = create_user(db_session, "video_worker_error_user")
+    frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture(frames),
+        failure=ModelUnavailableError("missing D:/secret/best.pt"),
+    )
+
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="road.mp4",
+        content=b"video",
+        confidence=0.25,
+        iou=0.45,
+        image_size=640,
+        sample_rate=1,
+        max_frames=1,
+    )
+    status = service.get_status(db_session, user.id, submission.task_id)
+
+    assert status["status"] == "failed"
+    assert status["error"] == "视频检测失败，请查看服务日志"
+    assert "D:/secret" not in status["error"]
+
+
+def test_progress_uses_planned_sample_window_when_max_frames_truncates_video():
+    assert VideoDetectionService._planned_source_frames(
+        total_frames=1000,
+        sample_rate=5,
+        max_frames=2,
+    ) == 6

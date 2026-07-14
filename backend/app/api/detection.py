@@ -1,5 +1,6 @@
 """Authenticated video and realtime camera detection endpoints."""
 
+import json
 from pathlib import Path
 
 from fastapi import (
@@ -13,11 +14,13 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from jose import JWTError
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from app.agent.detection_agent import detect_video_file
 from app.api.auth import get_current_user
 from app.config.settings import settings
+from app.core.logger import get_logger
 from app.core.security import decode_access_token
 from app.database.session import get_db
 from app.services.camera_detection_service import (
@@ -27,12 +30,14 @@ from app.services.camera_detection_service import (
 from app.services.detection_task_service import TaskNotFoundError
 from app.services.video_detection_service import (
     VideoProcessingError,
+    VideoQueueFullError,
     video_detection_service,
 )
 from app.services.yolo_detector import ModelUnavailableError
 from app.services.user_service import user_service
 
 router = APIRouter(prefix="/api/detection", tags=["视频与摄像头检测"])
+logger = get_logger(__name__)
 
 ALLOWED_VIDEO_EXTENSIONS = {
     ".mp4",
@@ -120,7 +125,16 @@ async def submit_video_detection(
             sample_rate=options[3],
             max_frames=options[4],
         )
-    except (ModelUnavailableError, VideoProcessingError) as exc:
+    except VideoQueueFullError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except ModelUnavailableError as exc:
+        logger.exception("Video detector is unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="检测模型暂不可用，请检查服务配置",
+        ) from exc
+    except VideoProcessingError as exc:
+        logger.exception("Unable to submit video detection task")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return {
@@ -179,25 +193,46 @@ async def camera_detection_websocket(
     configured = False
     try:
         while True:
-            message = await websocket.receive_json()
+            try:
+                message = await websocket.receive_json()
+            except json.JSONDecodeError:
+                await websocket.send_json(
+                    {"type": "error", "message": "Camera message is not valid JSON"}
+                )
+                continue
             message_type = message.get("type") if isinstance(message, dict) else None
             if message_type == "close":
                 await websocket.close(code=1000)
                 return
             try:
                 if message_type == "config":
-                    response = processor.configure(message)
+                    response = await run_in_threadpool(processor.configure, message)
                     configured = True
                 elif message_type == "frame":
                     if not configured:
                         raise CameraProtocolError(
                             "请先发送 config 消息初始化摄像头检测"
                         )
-                    response = processor.process_frame(message.get("data", ""))
+                    response = await run_in_threadpool(
+                        processor.process_frame,
+                        message.get("data", ""),
+                    )
                 else:
                     raise CameraProtocolError("Unsupported camera message type")
-            except (CameraProtocolError, ModelUnavailableError) as exc:
+            except CameraProtocolError as exc:
                 response = {"type": "error", "message": str(exc)}
+            except ModelUnavailableError:
+                logger.exception("Camera detector is unavailable")
+                response = {
+                    "type": "error",
+                    "message": "检测模型暂不可用，请检查服务配置",
+                }
+            except Exception:
+                logger.exception("Unexpected camera frame processing failure")
+                response = {
+                    "type": "error",
+                    "message": "摄像头帧处理失败，请查看服务日志",
+                }
             await websocket.send_json(response)
     except WebSocketDisconnect:
         return

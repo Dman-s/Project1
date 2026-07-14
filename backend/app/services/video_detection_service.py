@@ -2,10 +2,13 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
+import json
 from pathlib import Path
 import re
 import shutil
-from threading import RLock
+from threading import BoundedSemaphore, RLock
+from time import monotonic
 
 import cv2
 from sqlalchemy.orm import Session
@@ -27,6 +30,10 @@ class VideoProcessingError(RuntimeError):
     pass
 
 
+class VideoQueueFullError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class VideoTaskSubmission:
     task_id: int
@@ -36,24 +43,43 @@ class VideoTaskSubmission:
 class VideoProgressRegistry:
     """Process-local live state with persisted task fallback after restarts."""
 
-    def __init__(self):
+    def __init__(self, ttl_seconds: int | None = None, clock=monotonic):
         self._states: dict[int, dict] = {}
+        self._expires_at: dict[int, float] = {}
         self._lock = RLock()
+        self.ttl_seconds = ttl_seconds or settings.VIDEO_PROGRESS_TTL_SECONDS
+        self.clock = clock
 
     def create(self, task_id: int, state: dict) -> None:
         with self._lock:
+            self._prune_locked()
             self._states[task_id] = deepcopy(state)
+            self._expires_at.pop(task_id, None)
 
     def update(self, task_id: int, **changes) -> dict:
         with self._lock:
             state = self._states[task_id]
             state.update(deepcopy(changes))
+            if state.get("status") in {"completed", "failed"}:
+                self._expires_at[task_id] = self.clock() + self.ttl_seconds
             return deepcopy(state)
 
     def get(self, task_id: int) -> dict | None:
         with self._lock:
+            self._prune_locked()
             state = self._states.get(task_id)
             return deepcopy(state) if state is not None else None
+
+    def _prune_locked(self) -> None:
+        now = self.clock()
+        expired = [
+            task_id
+            for task_id, expires_at in self._expires_at.items()
+            if expires_at <= now
+        ]
+        for task_id in expired:
+            self._states.pop(task_id, None)
+            self._expires_at.pop(task_id, None)
 
 
 class VideoDetectionService:
@@ -68,12 +94,13 @@ class VideoDetectionService:
         capture_factory=None,
         executor=None,
         progress_registry: VideoProgressRegistry | None = None,
+        max_pending_tasks: int | None = None,
     ):
         self.task_service = task_service or detection_task_service
         self.detector = detector or self.task_service.detector
         self.session_factory = session_factory
-        if output_dir is not None:
-            self.task_service.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir or self.task_service.output_dir)
+        self.task_service.output_dir = self.output_dir
         self.temp_dir = Path(temp_dir or settings.video_temp_path)
         self.capture_factory = capture_factory or cv2.VideoCapture
         self.executor = executor or ThreadPoolExecutor(
@@ -81,6 +108,10 @@ class VideoDetectionService:
             thread_name_prefix="video-detection",
         )
         self.progress = progress_registry or VideoProgressRegistry()
+        self.max_pending_tasks = (
+            max_pending_tasks or settings.VIDEO_MAX_PENDING_TASKS
+        )
+        self._admission = BoundedSemaphore(self.max_pending_tasks)
         self._futures: set[Future] = set()
         self._future_lock = RLock()
 
@@ -99,39 +130,44 @@ class VideoDetectionService:
     ) -> VideoTaskSubmission:
         if sample_rate < 1 or max_frames < 1:
             raise ValueError("sample_rate and max_frames must be positive")
+        if not self._admission.acquire(blocking=False):
+            raise VideoQueueFullError("视频检测队列已满，请稍后重试")
 
-        safe_filename = Path(filename).name or "video.mp4"
-        scene, model_version = self.task_service.ensure_registry(db)
-        task = DetectionTask(
-            user_id=user_id,
-            scene_id=scene.id,
-            model_version_id=model_version.id,
-            task_type="video",
-            status="pending",
-            total_images=0,
-            total_objects=0,
-            total_inference_time=0.0,
-            conf_threshold=confidence,
-            iou_threshold=iou,
-            image_size=image_size,
-        )
-        db.add(task)
-        db.commit()
-        task_id = int(task.id)
-
-        source_dir = self.temp_dir / str(task_id)
-        source_dir.mkdir(parents=True, exist_ok=True)
-        source_path = source_dir / f"source{Path(safe_filename).suffix.lower()}"
+        future_submitted = False
         try:
-            source_path.write_bytes(content)
-        except Exception as exc:
-            task.status = "failed"
-            task.error_message = f"Unable to store uploaded video: {exc}"
+            safe_filename = Path(filename).name or "video.mp4"
+            scene, model_version = self.task_service.ensure_registry(db)
+            task = DetectionTask(
+                user_id=user_id,
+                scene_id=scene.id,
+                model_version_id=model_version.id,
+                task_type="video",
+                status="pending",
+                total_images=0,
+                total_objects=0,
+                total_inference_time=0.0,
+                conf_threshold=confidence,
+                iou_threshold=iou,
+                image_size=image_size,
+            )
+            db.add(task)
             db.commit()
-            shutil.rmtree(source_dir, ignore_errors=True)
-            raise VideoProcessingError(task.error_message) from exc
+            task_id = int(task.id)
 
-        initial_state = {
+            source_dir = self.temp_dir / str(task_id)
+            source_dir.mkdir(parents=True, exist_ok=True)
+            source_path = source_dir / f"source{Path(safe_filename).suffix.lower()}"
+            try:
+                source_path.write_bytes(content)
+            except Exception as exc:
+                logger.exception("Unable to store video upload for task %s", task_id)
+                task.status = "failed"
+                task.error_message = "无法保存上传视频"
+                db.commit()
+                shutil.rmtree(source_dir, ignore_errors=True)
+                raise VideoProcessingError(task.error_message) from exc
+
+            initial_state = {
             "task_id": task_id,
             "status": "pending",
             "progress": 0,
@@ -151,27 +187,32 @@ class VideoDetectionService:
             },
             "key_frames": [],
             "error": None,
-        }
-        self.progress.create(task_id, initial_state)
-        future = self.executor.submit(
-            self._process,
-            task_id,
-            safe_filename,
-            source_path,
-            confidence,
-            iou,
-            image_size,
-            sample_rate,
-            max_frames,
-        )
-        with self._future_lock:
-            self._futures.add(future)
-        future.add_done_callback(self._forget_future)
-        return VideoTaskSubmission(task_id=task_id, status="pending")
+            }
+            self.progress.create(task_id, initial_state)
+            future = self.executor.submit(
+                self._process,
+                task_id,
+                safe_filename,
+                source_path,
+                confidence,
+                iou,
+                image_size,
+                sample_rate,
+                max_frames,
+            )
+            future_submitted = True
+            with self._future_lock:
+                self._futures.add(future)
+            future.add_done_callback(self._forget_future)
+            return VideoTaskSubmission(task_id=task_id, status="pending")
+        finally:
+            if not future_submitted:
+                self._admission.release()
 
     def _forget_future(self, future: Future) -> None:
         with self._future_lock:
             self._futures.discard(future)
+        self._admission.release()
 
     def _process(
         self,
@@ -202,6 +243,8 @@ class VideoDetectionService:
             fps = max(0.0, float(capture.get(cv2.CAP_PROP_FPS)))
             width = max(0, int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
             height = max(0, int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            if total_frames <= 0 or fps <= 0 or width <= 0 or height <= 0:
+                raise VideoProcessingError("视频元数据无效，无法开始检测")
             metadata = {
                 "total_frames": total_frames,
                 "fps": round(fps, 3),
@@ -217,6 +260,11 @@ class VideoDetectionService:
             total_objects = 0
             total_inference_time = 0.0
             key_frames: list[dict] = []
+            planned_source_frames = self._planned_source_frames(
+                total_frames,
+                sample_rate,
+                max_frames,
+            )
 
             while sampled_frames < max_frames:
                 readable, frame = capture.read()
@@ -229,7 +277,7 @@ class VideoDetectionService:
                         task_id,
                         processed_frames,
                         sampled_frames,
-                        total_frames,
+                        planned_source_frames,
                         total_objects,
                         total_inference_time,
                         key_frames,
@@ -287,7 +335,7 @@ class VideoDetectionService:
                     task_id,
                     processed_frames,
                     sampled_frames,
-                    total_frames,
+                    planned_source_frames,
                     total_objects,
                     total_inference_time,
                     key_frames,
@@ -301,8 +349,6 @@ class VideoDetectionService:
             task.total_images = sampled_frames
             task.total_objects = total_objects
             task.total_inference_time = total_inference_time
-            from datetime import datetime
-
             task.completed_at = datetime.now()
             db.commit()
             self.progress.update(
@@ -316,22 +362,24 @@ class VideoDetectionService:
                 average_inference_time=total_inference_time / sampled_frames,
                 key_frames=key_frames,
             )
+            self._persist_terminal_state_safely(task_id)
         except Exception as exc:
             db.rollback()
+            public_error = self._public_error(exc)
             task = db.get(DetectionTask, task_id)
             if task is not None:
-                from datetime import datetime
-
                 task.status = "failed"
-                task.error_message = str(exc)
+                task.error_message = public_error
                 task.completed_at = datetime.now()
                 db.commit()
             logger.exception("Video detection task %s failed", task_id)
             self.progress.update(
                 task_id,
                 status="failed",
-                error=str(exc),
+                progress=100,
+                error=public_error,
             )
+            self._persist_terminal_state_safely(task_id)
         finally:
             if capture is not None:
                 capture.release()
@@ -343,14 +391,14 @@ class VideoDetectionService:
         task_id: int,
         processed_frames: int,
         sampled_frames: int,
-        total_frames: int,
+        progress_total_frames: int,
         total_objects: int,
         total_inference_time: float,
         key_frames: list[dict],
     ) -> None:
         progress = (
-            min(99, round(processed_frames / total_frames * 100))
-            if total_frames > 0
+            min(99, round(processed_frames / progress_total_frames * 100))
+            if progress_total_frames > 0
             else 0
         )
         self.progress.update(
@@ -371,7 +419,58 @@ class VideoDetectionService:
         state = self.progress.get(task_id)
         if state is not None:
             return state
+        persisted = self._load_terminal_state(task_id)
+        if persisted is not None:
+            return persisted
         return self._persisted_status(task)
+
+    def _persist_terminal_state(self, task_id: int) -> None:
+        state = self.progress.get(task_id)
+        if state is None:
+            return
+        task_dir = self.output_dir / str(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        status_path = task_dir / "video_status.json"
+        temporary_path = task_dir / "video_status.json.tmp"
+        temporary_path.write_text(
+            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary_path.replace(status_path)
+
+    def _persist_terminal_state_safely(self, task_id: int) -> None:
+        try:
+            self._persist_terminal_state(task_id)
+        except OSError:
+            logger.exception(
+                "Unable to persist video status sidecar for task %s",
+                task_id,
+            )
+
+    def _load_terminal_state(self, task_id: int) -> dict | None:
+        status_path = self.output_dir / str(task_id) / "video_status.json"
+        if not status_path.is_file():
+            return None
+        try:
+            return json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.exception("Unable to read video status sidecar for task %s", task_id)
+            return None
+
+    @staticmethod
+    def _planned_source_frames(
+        total_frames: int,
+        sample_rate: int,
+        max_frames: int,
+    ) -> int:
+        sample_window = 1 + (max_frames - 1) * sample_rate
+        return min(total_frames, sample_window)
+
+    @staticmethod
+    def _public_error(exc: Exception) -> str:
+        if isinstance(exc, VideoProcessingError):
+            return str(exc)
+        return "视频检测失败，请查看服务日志"
 
     def _persisted_status(self, task: DetectionTask) -> dict:
         grouped = OrderedDict()
@@ -441,7 +540,7 @@ class VideoDetectionService:
     def shutdown(self) -> None:
         shutdown = getattr(self.executor, "shutdown", None)
         if shutdown is not None:
-            shutdown(wait=False, cancel_futures=True)
+            shutdown(wait=True, cancel_futures=False)
 
 
 video_progress_registry = VideoProgressRegistry()

@@ -4,6 +4,7 @@ from app.api import detection
 from fastapi.websockets import WebSocketDisconnect
 import pytest
 from app.services.detection_task_service import TaskNotFoundError
+from app.services.yolo_detector import ModelUnavailableError
 
 
 def authenticate(client, username):
@@ -164,6 +165,13 @@ def test_camera_websocket_requires_config_then_streams_one_response_per_frame(
         "create_camera_processor",
         lambda: FakeCameraProcessor(),
     )
+    thread_calls = []
+
+    async def fake_run_in_threadpool(function, *args):
+        thread_calls.append(function.__name__)
+        return function(*args)
+
+    monkeypatch.setattr(detection, "run_in_threadpool", fake_run_in_threadpool)
 
     with client.websocket_connect(
         f"/api/detection/camera?token={token}"
@@ -185,6 +193,8 @@ def test_camera_websocket_requires_config_then_streams_one_response_per_frame(
         }
         websocket.send_json({"type": "close"})
 
+    assert thread_calls == ["configure", "process_frame"]
+
 
 def test_camera_websocket_rejects_missing_token(client):
     with pytest.raises(WebSocketDisconnect) as raised:
@@ -192,3 +202,31 @@ def test_camera_websocket_rejects_missing_token(client):
             pass
 
     assert raised.value.code == 4401
+
+
+def test_camera_websocket_recovers_from_malformed_json(client):
+    token = login_token(client, "camera_json_user")
+
+    with client.websocket_connect(
+        f"/api/detection/camera?token={token}"
+    ) as websocket:
+        websocket.send_text("{")
+        assert websocket.receive_json()["type"] == "error"
+        websocket.send_json({"type": "close"})
+
+
+def test_video_submission_hides_model_filesystem_details(client, monkeypatch):
+    headers = authenticate(client, "video_secure_error_user")
+
+    def fail_tool(**_kwargs):
+        raise ModelUnavailableError("missing D:/secret/models/best.pt")
+
+    monkeypatch.setattr(detection, "detect_video_file", fail_tool)
+    response = client.post(
+        "/api/detection/video",
+        headers=headers,
+        files={"video": ("road.mp4", b"video", "video/mp4")},
+    )
+
+    assert response.status_code == 503
+    assert "D:/secret" not in str(response.json())

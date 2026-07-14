@@ -1,10 +1,11 @@
 import base64
 import binascii
+from collections import deque
 from time import monotonic
 
 from app.config.settings import settings
 from app.services.tt100k_labels import tt100k_label_zh
-from app.services.yolo_detector import LocalYoloDetector
+from app.services.yolo_detector import InvalidImageError, LocalYoloDetector
 
 
 class CameraProtocolError(ValueError):
@@ -25,6 +26,7 @@ class CameraDetectionProcessor:
         self.config: dict | None = None
         self.frame_count = 0
         self.started_at = self.clock()
+        self.frame_times = deque(maxlen=30)
 
     def configure(self, message: dict) -> dict:
         mode = str(message.get("mode", "auto")).strip().lower()
@@ -67,6 +69,7 @@ class CameraDetectionProcessor:
         }
         self.frame_count = 0
         self.started_at = self.clock()
+        self.frame_times.clear()
         return {"type": "config_ok", **self.config}
 
     def process_frame(self, encoded_frame: str) -> dict:
@@ -88,13 +91,18 @@ class CameraDetectionProcessor:
         if not frame_bytes:
             raise CameraProtocolError("Camera frame is empty")
 
-        prediction = self.detector.predict_realtime(
-            frame_bytes,
-            confidence=self.config["confidence"],
-            iou=self.config["iou"],
-            image_size=self.config["image_size"],
-            device=self.config["device"],
-        )
+        try:
+            prediction = self.detector.predict_realtime(
+                frame_bytes,
+                confidence=self.config["confidence"],
+                iou=self.config["iou"],
+                image_size=self.config["image_size"],
+                device=self.config["device"],
+            )
+        except InvalidImageError as exc:
+            raise CameraProtocolError(
+                "Camera frame is not a valid image"
+            ) from exc
         detections = []
         for detection in prediction.detections:
             class_name_cn = tt100k_label_zh(detection.class_name)
@@ -110,7 +118,13 @@ class CameraDetectionProcessor:
             )
 
         self.frame_count += 1
-        elapsed = max(self.clock() - self.started_at, 0.001)
+        now = self.clock()
+        self.frame_times.append(now)
+        if len(self.frame_times) > 1:
+            elapsed = max(self.frame_times[-1] - self.frame_times[0], 0.001)
+            current_fps = (len(self.frame_times) - 1) / elapsed
+        else:
+            current_fps = 1 / max(now - self.started_at, 0.001)
         return {
             "type": "result",
             "annotated_frame": base64.b64encode(
@@ -119,7 +133,7 @@ class CameraDetectionProcessor:
             "detections": detections,
             "object_count": len(detections),
             "inference_time": round(prediction.inference_time_ms, 2),
-            "fps": round(self.frame_count / elapsed, 1),
+            "fps": round(current_fps, 1),
             "frame_count": self.frame_count,
             "device": self.config["device"],
         }

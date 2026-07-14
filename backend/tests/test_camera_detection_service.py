@@ -8,7 +8,7 @@ from app.services.camera_detection_service import (
     CameraDetectionProcessor,
     CameraProtocolError,
 )
-from app.services.yolo_detector import DetectedObject, ImagePrediction
+from app.services.yolo_detector import DetectedObject, ImagePrediction, InvalidImageError
 
 
 def make_jpeg():
@@ -27,6 +27,8 @@ class FakeCameraDetector:
         self.warmup_calls.append((image_size, device))
 
     def predict_realtime(self, image_bytes, confidence, iou, image_size, device):
+        if image_bytes == b"not-an-image":
+            raise InvalidImageError("decoder details")
         self.predict_calls.append(
             (image_bytes, confidence, iou, image_size, device)
         )
@@ -112,3 +114,14 @@ def test_camera_protocol_rejects_invalid_and_oversized_base64_frames():
         processor.process_frame("not-base64")
     with pytest.raises(CameraProtocolError, match="too large"):
         processor.process_frame(base64.b64encode(b"12345").decode("ascii"))
+
+
+def test_camera_protocol_converts_non_image_bytes_to_protocol_error():
+    detector = FakeCameraDetector()
+    processor = CameraDetectionProcessor(detector=detector)
+    processor.configure({"type": "config", "mode": "gpu"})
+
+    with pytest.raises(CameraProtocolError, match="valid image"):
+        processor.process_frame(
+            base64.b64encode(b"not-an-image").decode("ascii")
+        )

@@ -32,8 +32,8 @@ export default function CameraDetection() {
   const clientRef = useRef(null)
   const captureTimerRef = useRef(null)
   const activeRef = useRef(false)
+  const sessionRef = useRef(0)
   const sendWidthRef = useRef(640)
-  const modeRef = useRef('auto')
   const [mode, setMode] = useState('auto')
   const [confidence, setConfidence] = useState(0.25)
   const [connection, setConnection] = useState('idle')
@@ -41,10 +41,6 @@ export default function CameraDetection() {
   const [stats, setStats] = useState({ fps: 0, inference: 0, frames: 0 })
   const [detections, setDetections] = useState([])
   const [error, setError] = useState('')
-
-  useEffect(() => {
-    modeRef.current = mode
-  }, [mode])
 
   const scheduleCapture = useCallback((callback, delay = 0) => {
     clearTimeout(captureTimerRef.current)
@@ -86,16 +82,21 @@ export default function CameraDetection() {
     })
   }, [])
 
+  const releaseMedia = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    if (videoRef.current) videoRef.current.srcObject = null
+  }, [])
+
   const stopDetection = useCallback(() => {
+    sessionRef.current += 1
     activeRef.current = false
     clearTimeout(captureTimerRef.current)
     clientRef.current?.close()
     clientRef.current = null
-    streamRef.current?.getTracks().forEach((track) => track.stop())
-    streamRef.current = null
-    if (videoRef.current) videoRef.current.srcObject = null
+    releaseMedia()
     setConnection('idle')
-  }, [])
+  }, [releaseMedia])
 
   const startDetection = useCallback(async () => {
     setError('')
@@ -108,6 +109,7 @@ export default function CameraDetection() {
       return
     }
     stopDetection()
+    const session = sessionRef.current
     setConnection('requesting')
     setStats({ fps: 0, inference: 0, frames: 0 })
     setDetections([])
@@ -116,12 +118,25 @@ export default function CameraDetection() {
         video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       })
+      if (session !== sessionRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
       streamRef.current = stream
+      if (!videoRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
       videoRef.current.srcObject = stream
       await videoRef.current.play()
+      if (session !== sessionRef.current) {
+        releaseMedia()
+        return
+      }
       setConnection('connecting')
       const client = new CameraDetectionClient({
         onMessage: async (message) => {
+          if (session !== sessionRef.current) return
           if (message.type === 'config_ok') {
             setDevice(message.device)
             sendWidthRef.current = message.image_size || 640
@@ -136,29 +151,43 @@ export default function CameraDetection() {
             })
             setDetections(message.detections || [])
             await drawResult(message.annotated_frame)
-            if (activeRef.current) {
+            if (session === sessionRef.current && activeRef.current) {
               scheduleCapture(captureFrame, message.device === 'cpu' ? 120 : 20)
             }
           }
         },
         onError: (message) => {
+          if (session !== sessionRef.current) return
           setError(message)
           if (activeRef.current) scheduleCapture(captureFrame, 150)
         },
         onClose: () => {
+          if (session !== sessionRef.current) return
+          sessionRef.current += 1
           activeRef.current = false
+          clearTimeout(captureTimerRef.current)
+          clientRef.current = null
+          releaseMedia()
           setConnection('idle')
         },
       })
       clientRef.current = client
       client.connect({ mode, conf: confidence, iou: 0.45 })
     } catch (reason) {
+      if (session !== sessionRef.current) return
       stopDetection()
       setError(reason?.message || '无法启动摄像头')
     }
-  }, [captureFrame, confidence, drawResult, mode, scheduleCapture, stopDetection])
+  }, [captureFrame, confidence, drawResult, mode, releaseMedia, scheduleCapture, stopDetection])
 
-  useEffect(() => () => stopDetection(), [stopDetection])
+  useEffect(() => () => {
+    sessionRef.current += 1
+    activeRef.current = false
+    clearTimeout(captureTimerRef.current)
+    clientRef.current?.close()
+    clientRef.current = null
+    releaseMedia()
+  }, [releaseMedia])
 
   const isStarting = connection === 'requesting' || connection === 'connecting'
   const isActive = connection === 'active'

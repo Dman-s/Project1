@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     VIDEO_FRAME_SAMPLE_RATE: int = Field(default=5, ge=1)
     VIDEO_MAX_FRAMES: int = Field(default=50, ge=1)
     VIDEO_WORKERS: int = Field(default=2, ge=1, le=8)
+    VIDEO_MAX_PENDING_TASKS: int = Field(default=4, ge=1, le=32)
+    VIDEO_PROGRESS_TTL_SECONDS: int = Field(default=3600, ge=1)
     VIDEO_TEMP_DIR: str = "./uploads/videos"
     CAMERA_CPU_IMAGE_SIZE: int = Field(default=416, ge=32)
     CAMERA_GPU_IMAGE_SIZE: int = Field(default=640, ge=32)

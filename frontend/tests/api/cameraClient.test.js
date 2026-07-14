@@ -76,4 +76,22 @@ describe('CameraDetectionClient', () => {
     client.close()
     expect(socket.readyState).toBe(3)
   })
+
+  it('cancels a connecting socket and ignores its late callbacks', () => {
+    const onOpen = vi.fn()
+    const client = new CameraDetectionClient({
+      url: 'ws://localhost/camera',
+      WebSocketImpl: FakeWebSocket,
+      onOpen,
+    })
+    const socket = client.connect({ mode: 'auto' })
+    socket.readyState = 0
+
+    client.close()
+    socket.emitOpen()
+
+    expect(socket.readyState).toBe(3)
+    expect(onOpen).not.toHaveBeenCalled()
+    expect(socket.sent).toEqual([])
+  })
 })

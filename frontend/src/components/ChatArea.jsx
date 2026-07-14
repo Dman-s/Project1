@@ -123,7 +123,7 @@ export function ChatArea() {
         <input
           id={`video-upload-${conversationId}`}
           type="file"
-          accept="video/*,.mp4,.avi,.mov,.mkv,.wmv,.flv"
+          accept=".mp4,.avi,.mov,.mkv,.wmv,.flv"
           onChange={(event) => handleVideoUpload(event, conversationId)}
           className="hidden"
         />
@@ -371,7 +371,7 @@ export function ChatArea() {
         <input
           id={`sign-video-upload-${conversationId}`}
           type="file"
-          accept="video/*,.mp4,.avi,.mov,.mkv,.wmv,.flv"
+          accept=".mp4,.avi,.mov,.mkv,.wmv,.flv"
           onChange={(event) => handleVideoUpload(event, conversationId)}
           className="hidden"
         />
