@@ -15,6 +15,10 @@ from fastapi.staticfiles import StaticFiles
 
 def init_minio():
     """初始化 MinIO 存储桶"""
+    if not settings.minio_enabled:
+        print("MinIO 已在当前运行模式中禁用")
+        return
+
     from app.storage.minio_client import MinIOClient
 
     try:
@@ -29,6 +33,10 @@ async def lifespan(_app: FastAPI):
     """应用生命周期管理"""
     # 启动时执行
     print("正在初始化服务...")
+
+    from app.database.session import initialize_local_database
+
+    initialize_local_database()
     init_minio()
     
     from app.services.scheduler_service import scheduler_service
@@ -69,8 +77,8 @@ app.include_router(chat_session_router)
 # ── 静态文件服务 ───────────────────────────────────────
 # 用于访问上传的头像文件
 uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
-if os.path.exists(uploads_dir):
-    app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
+os.makedirs(uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,

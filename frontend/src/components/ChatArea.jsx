@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
 import { Bot, User, Sparkles, Upload, FolderOpen, Loader2, Image } from 'lucide-react'
 import { useStore } from '../store/useStore'
+import { SignDetectionResult } from './SignDetectionResult'
 
 export function ChatArea() {
   const { conversations, activeConversationId, user, recognizeLicensePlate, recognizeHumans, recognizeSigns, loading } = useStore()
@@ -387,6 +388,8 @@ export function ChatArea() {
                 <div className="max-w-[75%]">
                   {renderSignUploadCard(message.conversationId)}
                 </div>
+              ) : message.type === 'sign_result' ? (
+                <SignDetectionResult data={message.resultData} />
               ) : (
                 <div
                   className={`max-w-[75%] p-4 rounded-2xl ${

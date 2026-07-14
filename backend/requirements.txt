@@ -15,7 +15,11 @@ openai==1.50.0 # OpenAI API SDK
 # ── 本地 LLM 备选 ────────────────────────────────────
 ollama==0.3.0 #本地 LLM 模型备选
 # ── ⽬标检测（YOLOv11）────────────────────────────────
-ultralytics==8.3.0 # Ultralytics YOLO框架（包含PyTorch）
+# GPU 优先：Windows + NVIDIA CUDA 12.8 的匹配运行时
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+ultralytics==8.3.0 # Ultralytics YOLO框架
 opencv-python==4.8.0.76 # OpenCV图像处理库
 Pillow==10.0.0 # Pillow图像处理库
 # ── 数据库（PostgreSQL + ORM）─────────────────────────

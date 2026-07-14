@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { formatSignResult } from '../utils/signResults'
 
 const API_BASE = '/api'
 
@@ -12,44 +13,6 @@ const mockResponses = [
 
 const generateResponse = () => {
   return mockResponses[Math.floor(Math.random() * mockResponses.length)]
-}
-
-const formatSignResult = (data) => {
-  if (!data) return '识别完成'
-  
-  let result = `识别时间：${data.time}\n\n`
-  result += `共识别 ${data.total_images} 张图片\n`
-  
-  if (data.total_signs > 0) {
-    result += `\n🚦 交通标志（共 ${data.total_signs} 个）：\n`
-    data.results?.forEach((imageResult, index) => {
-      if (imageResult.traffic_signs && imageResult.traffic_signs.length > 0) {
-        result += `\n图片 ${index + 1}：\n`
-        imageResult.traffic_signs.forEach(sign => {
-          result += `- ${sign.type}：${sign.value || '无'}，置信度 ${sign.confidence}%\n`
-        })
-      }
-    })
-  }
-  
-  if (data.total_lights > 0) {
-    result += `\n🔴 交通信号灯（共 ${data.total_lights} 个）：\n`
-    data.results?.forEach((imageResult, index) => {
-      if (imageResult.traffic_lights && imageResult.traffic_lights.length > 0) {
-        result += `\n图片 ${index + 1}：\n`
-        imageResult.traffic_lights.forEach(light => {
-          const statusText = { red: '红灯', green: '绿灯', yellow: '黄灯' }
-          result += `- 信号灯：${statusText[light.status] || light.status}，置信度 ${light.confidence}%\n`
-        })
-      }
-    })
-  }
-  
-  if (data.total_signs === 0 && data.total_lights === 0) {
-    result += '\n未识别到交通标志和信号灯'
-  }
-  
-  return result
 }
 
 const getToken = () => {
@@ -387,7 +350,8 @@ export const useStore = create((set, get) => ({
                     role: 'assistant',
                     content: resultContent,
                     createdAt: new Date(),
-                    type: 'text',
+                    type: 'sign_result',
+                    resultData: data.data,
                   },
                 ],
               }
