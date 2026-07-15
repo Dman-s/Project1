@@ -369,6 +369,20 @@ function Get-ExactNodeVersion {
     return $result.StdOut.Trim().TrimStart("v")
 }
 
+function Test-NpmRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$NpmPath,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    )
+
+    try {
+        $result = Invoke-CheckedCommand -FilePath $NpmPath -ArgumentList @("--version") -WorkingDirectory $WorkingDirectory -TimeoutSeconds 30
+        return -not [string]::IsNullOrWhiteSpace($result.StdOut)
+    } catch {
+        return $false
+    }
+}
+
 function Install-PythonRuntimeAtomically {
     param(
         [Parameter(Mandatory = $true)][pscustomobject]$Paths,
@@ -384,7 +398,7 @@ function Install-PythonRuntimeAtomically {
                 "Include_test=0",
                 "TargetDir=$TargetDir"
             )
-            Invoke-CheckedCommand -FilePath $InstallerPath -ArgumentList $installArguments | Out-Null
+            Invoke-CheckedCommand -FilePath $InstallerPath -ArgumentList $installArguments -TimeoutSeconds 900 | Out-Null
         },
         [scriptblock]$PythonVersionResolver = {
             param($PythonPath)
@@ -665,7 +679,7 @@ function Resolve-NodeRuntime {
 
     if ((Test-Path -LiteralPath $localNodePath -PathType Leaf) -and (Test-Path -LiteralPath $localNpmPath -PathType Leaf)) {
         try {
-            if ((Get-ExactNodeVersion -NodePath $localNodePath) -eq $expectedVersion) {
+            if (((Get-ExactNodeVersion -NodePath $localNodePath) -eq $expectedVersion) -and (Test-NpmRuntime -NpmPath $localNpmPath -WorkingDirectory $Paths.Root)) {
                 return [pscustomobject]@{
                     NodePath = $localNodePath
                     NpmPath = $localNpmPath
@@ -682,6 +696,9 @@ function Resolve-NodeRuntime {
             $pathNpm = Join-Path $nodeDirectory "npm.cmd"
             if (-not (Test-Path -LiteralPath $pathNpm -PathType Leaf)) {
                 throw "SkipRuntimeDownload requires node.exe and npm.cmd from the same directory. Resolved node.exe at '$pathNode' but npm.cmd was not found beside it."
+            }
+            if (-not (Test-NpmRuntime -NpmPath $pathNpm -WorkingDirectory $Paths.Root)) {
+                throw "SkipRuntimeDownload found Node $expectedVersion at '$pathNode', but the sibling npm.cmd could not execute successfully."
             }
             return [pscustomobject]@{
                 NodePath = $pathNode
@@ -708,7 +725,7 @@ function Install-BackendPythonEnvironment {
         [Parameter(Mandatory = $true)][string]$GpuRequirementsPath,
         [scriptblock]$VenvCreator = {
             param($InterpreterPath, $TargetPath)
-            Invoke-CheckedCommand -FilePath $InterpreterPath -ArgumentList @("-m", "venv", $TargetPath) | Out-Null
+            Invoke-CheckedCommand -FilePath $InterpreterPath -ArgumentList @("-m", "venv", $TargetPath) -TimeoutSeconds 300 | Out-Null
         },
         [scriptblock]$RequirementsInstaller = {
             param($VenvPythonPath, $RequirementsPath, $WorkingDirectory)
@@ -794,15 +811,16 @@ function Install-PythonRequirements {
         [Parameter(Mandatory = $true)][string]$WorkingDirectory
     )
 
-    Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-m", "pip", "install", "-r", $RequirementsPath) -WorkingDirectory $WorkingDirectory | Out-Null
-    Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-m", "pip", "check") -WorkingDirectory $WorkingDirectory | Out-Null
+    Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-m", "pip", "install", "--upgrade", "pip==26.1.2", "setuptools==81.0.0") -WorkingDirectory $WorkingDirectory -TimeoutSeconds 600 | Out-Null
+    Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-m", "pip", "install", "-r", $RequirementsPath) -WorkingDirectory $WorkingDirectory -TimeoutSeconds 3600 | Out-Null
+    Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-m", "pip", "check") -WorkingDirectory $WorkingDirectory -TimeoutSeconds 300 | Out-Null
 }
 
 function Test-TorchCudaAvailable {
     param([Parameter(Mandatory = $true)][string]$PythonPath)
 
     $command = "import torch; print('true' if torch.cuda.is_available() else 'false')"
-    $result = Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-c", $command)
+    $result = Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-c", $command) -TimeoutSeconds 120
     return $result.StdOut.Trim().ToLowerInvariant() -eq "true"
 }
 
@@ -812,7 +830,7 @@ function Invoke-NpmInstall {
         [Parameter(Mandatory = $true)][string]$FrontendRoot
     )
 
-    Invoke-CheckedCommand -FilePath $NpmPath -ArgumentList @("ci") -WorkingDirectory $FrontendRoot | Out-Null
+    Invoke-CheckedCommand -FilePath $NpmPath -ArgumentList @("ci") -WorkingDirectory $FrontendRoot -TimeoutSeconds 1800 | Out-Null
 }
 
 function Ensure-ModelFiles {
@@ -850,10 +868,21 @@ function Ensure-EnvFile {
     [System.IO.File]::WriteAllText($Paths.EnvPath, $content, $utf8NoBom)
 }
 
+function Ensure-LocalDataDirectory {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Paths)
+
+    $dataPath = Resolve-ContainedPath -RootPath $Paths.Root -Path (Join-Path $Paths.BackendRoot "data") -Description "Local backend data directory"
+    Assert-NoReparsePointTraversal -RootPath $Paths.Root -Path $dataPath
+    if (-not (Test-Path -LiteralPath $dataPath -PathType Container)) {
+        New-Item -ItemType Directory -Path $dataPath -Force | Out-Null
+    }
+}
+
 function Invoke-OptionalScript {
     param(
         [Parameter(Mandatory = $true)][string]$ScriptPath,
-        [Parameter(Mandatory = $true)][string]$ProjectRoot
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 300
     )
 
     if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
@@ -867,7 +896,7 @@ function Invoke-OptionalScript {
         "Bypass",
         "-File",
         $ScriptPath
-    ) -WorkingDirectory $ProjectRoot | Out-Null
+    ) -WorkingDirectory $ProjectRoot -TimeoutSeconds $TimeoutSeconds | Out-Null
 }
 
 function New-Plan {
@@ -993,6 +1022,7 @@ function Invoke-BootstrapWorkflow {
     }
 
     Ensure-EnvFile -Paths $paths -SelectedDevice $selectedDevice -Force:$ForceConfig
+    Ensure-LocalDataDirectory -Paths $paths
     Invoke-OptionalScript -ScriptPath $paths.DoctorPath -ProjectRoot $paths.Root
     if ($Start) {
         Invoke-OptionalScript -ScriptPath $paths.StartPath -ProjectRoot $paths.Root

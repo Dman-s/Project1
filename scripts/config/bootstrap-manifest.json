@@ -24,17 +24,8 @@
         "sha256": "E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88",
         "url": "https://github.com/Dman-s/Project1/releases/download/models-v1/tt100k-yolo11s-reference42.pt",
         "purpose": "default detector",
-        "source": "user-provided 42-class reference training project",
-        "license": "AGPL-3.0"
-      },
-      {
-        "filename": "tt100k-yolo11n-common45.pt",
-        "bytes": 5488602,
-        "sha256": "A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13",
-        "url": "https://github.com/Dman-s/Project1/releases/download/models-v1/tt100k-yolo11n-common45.pt",
-        "purpose": "optional detector",
-        "source": "Project1 TT100K common-45 training",
-        "license": "AGPL-3.0"
+        "source": "42-class YOLO11 TT100K training project supplied by the repository owner",
+        "license": "Ultralytics AGPL-3.0; TT100K CC-BY-NC"
       },
       {
         "filename": "gtsrb-yolo11n-cls.pt",

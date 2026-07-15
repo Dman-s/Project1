@@ -511,6 +511,7 @@ function Initialize-ProjectProcessNativeMethods {
 
     $source = @'
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Runtime.InteropServices;
 
@@ -523,6 +524,24 @@ namespace Project1.Windows
         private const int AF_INET = 2;
         private const int TCP_TABLE_OWNER_PID_LISTENER = 3;
         private const uint ERROR_INSUFFICIENT_BUFFER = 122;
+        private const uint TH32CS_SNAPPROCESS = 0x00000002;
+        private const int MAX_PATH = 260;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = MAX_PATH)]
+            public string szExeFile;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct UNICODE_STRING
@@ -550,6 +569,17 @@ namespace Project1.Windows
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Process32FirstW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
         [DllImport("ntdll.dll")]
         private static extern int NtQueryInformationProcess(
             IntPtr processHandle,
@@ -566,6 +596,68 @@ namespace Project1.Windows
             int ipVersion,
             int tableClass,
             uint reserved);
+
+        public static int[] GetDescendantProcessIds(int rootProcessId)
+        {
+            IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == new IntPtr(-1))
+            {
+                return new int[0];
+            }
+
+            var children = new Dictionary<int, List<int>>();
+            try
+            {
+                PROCESSENTRY32 entry = new PROCESSENTRY32();
+                entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                if (Process32FirstW(snapshot, ref entry))
+                {
+                    do
+                    {
+                        int parentId = unchecked((int)entry.th32ParentProcessID);
+                        int processId = unchecked((int)entry.th32ProcessID);
+                        List<int> childIds;
+                        if (!children.TryGetValue(parentId, out childIds))
+                        {
+                            childIds = new List<int>();
+                            children[parentId] = childIds;
+                        }
+                        childIds.Add(processId);
+                        entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                    }
+                    while (Process32NextW(snapshot, ref entry));
+                }
+            }
+            finally
+            {
+                CloseHandle(snapshot);
+            }
+
+            var descendants = new List<int>();
+            var queue = new Queue<int>();
+            var seen = new HashSet<int>();
+            queue.Enqueue(rootProcessId);
+            seen.Add(rootProcessId);
+            while (queue.Count > 0)
+            {
+                int parentId = queue.Dequeue();
+                List<int> childIds;
+                if (!children.TryGetValue(parentId, out childIds))
+                {
+                    continue;
+                }
+                foreach (int childId in childIds)
+                {
+                    if (!seen.Add(childId))
+                    {
+                        continue;
+                    }
+                    descendants.Add(childId);
+                    queue.Enqueue(childId);
+                }
+            }
+            return descendants.ToArray();
+        }
 
         public static string ReadCommandLine(int processId)
         {
@@ -818,6 +910,40 @@ function Test-ProjectProcessIdentity {
     return $true
 }
 
+function Stop-CheckedCommandProcessTree {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
+
+    if ($Process.HasExited) {
+        return
+    }
+
+    Initialize-ProjectProcessNativeMethods
+    $descendantIds = @([Project1.Windows.ProcessIntrospection]::GetDescendantProcessIds($Process.Id))
+
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill()
+        }
+    } catch {
+    }
+
+    for ($index = $descendantIds.Count - 1; $index -ge 0; $index--) {
+        $child = Get-Process -Id $descendantIds[$index] -ErrorAction SilentlyContinue
+        if ($null -eq $child) {
+            continue
+        }
+        try {
+            if (-not $child.HasExited) {
+                $child.Kill()
+                [void]$child.WaitForExit(5000)
+            }
+        } catch {
+        } finally {
+            $child.Dispose()
+        }
+    }
+}
+
 function Invoke-CheckedCommand {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -844,12 +970,7 @@ function Invoke-CheckedCommand {
         $stderrTask = $process.StandardError.ReadToEndAsync()
 
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try {
-                if (-not $process.HasExited) {
-                    $process.Kill()
-                }
-            } catch {
-            }
+            Stop-CheckedCommandProcessTree -Process $process
 
             [void]$process.WaitForExit(5000)
             try {

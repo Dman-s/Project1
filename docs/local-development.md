@@ -129,7 +129,7 @@ curl.exe -H "Authorization: Bearer <TOKEN>" `
 
 ## 模型、标签和已测结果
 
-默认 TT100K 检测器是 `models/tt100k-yolo11s-reference42.pt`。该参考权重在其自带 42 类验证集上的记录为：P `0.74464`、R `0.67341`、mAP50 `0.74842`、mAP50-95 `0.57963`。这套切分与 corrected common-45 验证集不同，指标不能直接横向比较。
+默认 TT100K 检测器是 `models/tt100k-yolo11s-reference42.pt`。它来自仓库所有者提供的 42 类 YOLO11 TT100K 训练工程；公开使用与再分发同时受 Ultralytics AGPL-3.0 和 TT100K CC-BY-NC（非商业）条款约束。该权重在其自带 42 类验证集上的记录为：P `0.74464`、R `0.67341`、mAP50 `0.74842`、mAP50-95 `0.57963`。
 
 推理层把 reference42 类别编号映射到项目统一的 TT100K common-45 编号，并使用 SAHI `512x512` 切片、重叠率 `0.2` 检测小目标。该权重缺少 `ph5`、`w32`、`wo` 三类。真实 GPU API 验证中，`97549.jpg` 从整图推理误判的 `pl60` 修正为与官方标注一致的 `pl40`，置信度 `89.32%`，推理耗时约 `343 ms`。
 

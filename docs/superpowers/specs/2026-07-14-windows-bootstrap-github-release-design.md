@@ -95,7 +95,7 @@ Windows Update、PostgreSQL、Redis 或 MinIO，优先使用 NVIDIA GPU，并在
   YOLO11 交通标志检测平台，Topics 包含 `yolo11`、`traffic-sign-detection`、
   `fastapi`、`react`、`pytorch`、`computer-vision`。
 - 仓库源代码许可、Ultralytics 义务、训练数据条款和模型再分发资格分别说明。
-  TT100K 按官方 CC BY-NC 条款署名并引用；来源链或授权不完整的检查点不得发布。
+  TT100K 按官方 CC BY-NC 条款署名并引用；本次只发布仓库所有者明确指定的 42 类检查点，不发布项目训练的 common-45 检查点。
 
 ## GitHub 发布流程
 

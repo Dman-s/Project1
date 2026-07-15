@@ -221,7 +221,7 @@ function Get-ProjectEnvironmentTests {
                 Assert-Equal -Expected "0AE68406B42D7725661DA979B1403EC9926DA205C6770827F33AAC9D8F26E821" -Actual $manifest.runtime.node.sha256 -Message "Node SHA mismatch."
                 Assert-Equal -Expected "Dman-s/Project1" -Actual $manifest.release.repository -Message "Repository mismatch."
                 Assert-Equal -Expected "models-v1" -Actual $manifest.release.tag -Message "Release tag mismatch."
-                Assert-Equal -Expected 3 -Actual $manifest.release.models.Count -Message "Model count mismatch."
+                Assert-Equal -Expected 2 -Actual $manifest.release.models.Count -Message "Model count mismatch."
 
                 $expectedModels = @(
                     [pscustomobject]@{
@@ -230,17 +230,8 @@ function Get-ProjectEnvironmentTests {
                         Sha256 = "E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88"
                         Url = "https://github.com/Dman-s/Project1/releases/download/models-v1/tt100k-yolo11s-reference42.pt"
                         Purpose = "default detector"
-                        Source = "user-provided 42-class reference training project"
-                        License = "AGPL-3.0"
-                    },
-                    [pscustomobject]@{
-                        Filename = "tt100k-yolo11n-common45.pt"
-                        Bytes = 5488602
-                        Sha256 = "A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13"
-                        Url = "https://github.com/Dman-s/Project1/releases/download/models-v1/tt100k-yolo11n-common45.pt"
-                        Purpose = "optional detector"
-                        Source = "Project1 TT100K common-45 training"
-                        License = "AGPL-3.0"
+                        Source = "42-class YOLO11 TT100K training project supplied by the repository owner"
+                        License = "Ultralytics AGPL-3.0; TT100K CC-BY-NC"
                     },
                     [pscustomobject]@{
                         Filename = "gtsrb-yolo11n-cls.pt"
@@ -729,7 +720,7 @@ function Get-ProjectEnvironmentTests {
                     $expected = $expectedLines -join "`r`n"
                     Assert-Equal -Expected ($expected + "`r`n") -Actual $content -Message "Local env content mismatch."
                     Assert-Contains -ExpectedSubstring "YOLO_USE_SAHI=true" -Actual $content -Message "Public template must keep SAHI enabled for the default detector."
-                    Assert-Contains -ExpectedSubstring "YOLO_MODEL_NAME=tt100k-yolo11s-reference42" -Actual $content -Message "Public template must identify the default detector."
+                    Assert-Contains -ExpectedSubstring "YOLO_MODEL_NAME=tt100k-yolo11s-reference42" -Actual $content -Message "Public template must identify the requested 42-class detector."
                     Assert-False -Condition ($content.Contains("should-not-leak")) -Message "Unexpected environment leak."
 
                     $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N") + ".env.example")
@@ -753,6 +744,19 @@ function Get-ProjectEnvironmentTests {
                 } finally {
                     $env:UNRELATED_SECRET_TOKEN = $previous
                 }
+            }
+        },
+        @{
+            Name = "Repository manifest publishes only the requested 42-class detector"
+            Body = {
+                $manifest = Read-BootstrapManifest -Path $ManifestPath
+                $filenames = @($manifest.release.models | ForEach-Object { [string]$_.filename })
+                Assert-True -Condition ($filenames -contains "tt100k-yolo11s-reference42.pt") -Message "The release manifest must include the requested 42-class detector."
+                Assert-False -Condition ($filenames -contains "tt100k-yolo11n-common45.pt") -Message "The project-trained common-45 detector must not be published."
+                $defaultDetector = @($manifest.release.models | Where-Object { $_.purpose -eq "default detector" })
+                Assert-Equal -Expected 1 -Actual $defaultDetector.Count -Message "The release manifest must identify one default detector."
+                Assert-Equal -Expected "tt100k-yolo11s-reference42.pt" -Actual $defaultDetector[0].filename -Message "The 42-class detector should be the release default."
+                Assert-Contains -ExpectedSubstring "TT100K CC-BY-NC" -Actual ([string]$defaultDetector[0].license) -Message "TT100K-derived weights must carry the dataset restriction in metadata."
             }
         },
         @{
@@ -1099,6 +1103,48 @@ Start-Sleep -Seconds 30
                     Start-Sleep -Milliseconds 200
                     Assert-True -Condition ($null -eq (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) -Message "Timed-out child process was not terminated."
                 } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Invoke-CheckedCommand timeout terminates the complete child process tree"
+            Body = {
+                $fixture = New-TempFixture
+                $grandchildPid = $null
+                try {
+                    $grandchildScript = Join-Path $fixture "grandchild.ps1"
+                    $parentScript = Join-Path $fixture "parent.ps1"
+                    $grandchildPidPath = Join-Path $fixture "grandchild.pid"
+                    @"
+Set-Content -LiteralPath '$($grandchildPidPath.Replace("'", "''"))' -Value `$PID -Encoding ASCII
+Start-Sleep -Seconds 30
+"@ | Set-Content -LiteralPath $grandchildScript -Encoding ASCII
+                    @"
+`$powershellPath = Join-Path `$PSHOME 'powershell.exe'
+`$null = Start-Process -FilePath `$powershellPath -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '$($grandchildScript.Replace("'", "''"))') -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 30
+"@ | Set-Content -LiteralPath $parentScript -Encoding ASCII
+
+                    $filePath = Join-Path $PSHOME "powershell.exe"
+                    [void](Assert-Throws -Action {
+                        Invoke-CheckedCommand -FilePath $filePath -ArgumentList @(
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            $parentScript
+                        ) -TimeoutSeconds 3
+                    } -ExpectedMessage "timed out")
+
+                    Assert-True -Condition (Test-Path -LiteralPath $grandchildPidPath -PathType Leaf) -Message "Grandchild did not publish its PID before timeout."
+                    $grandchildPid = [int](Get-Content -LiteralPath $grandchildPidPath -Raw).Trim()
+                    Start-Sleep -Milliseconds 300
+                    Assert-True -Condition ($null -eq (Get-Process -Id $grandchildPid -ErrorAction SilentlyContinue)) -Message "Timed-out command left a grandchild process running."
+                } finally {
+                    if ($null -ne $grandchildPid) {
+                        Stop-Process -Id $grandchildPid -Force -ErrorAction SilentlyContinue
+                    }
                     Remove-TempFixture -Path $fixture
                 }
             }

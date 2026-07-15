@@ -223,6 +223,18 @@ function Get-DoctorExactNodeVersion {
     return $result.StdOut.Trim().TrimStart("v")
 }
 
+function Get-DoctorExactNpmVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$NpmPath,
+        [string]$ProjectRoot,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 15
+    )
+
+    $resolvedNpmPath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $NpmPath -ProjectRoot $ProjectRoot -RuntimeName "npm"
+    $result = Invoke-CheckedCommand -FilePath $resolvedNpmPath -ArgumentList @("--version") -WorkingDirectory $ProjectRoot -TimeoutSeconds $TimeoutSeconds
+    return $result.StdOut.Trim()
+}
+
 function Get-DoctorPythonInfo {
     param(
         [Parameter(Mandatory = $true)][object]$Paths,
@@ -269,11 +281,14 @@ function Get-DoctorNodeInfo {
         }
 
         $resolvedNodePath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $Paths.LocalNodePath -ProjectRoot $Paths.Root -RuntimeName "Node"
+        $resolvedNpmPath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $Paths.LocalNpmPath -ProjectRoot $Paths.Root -RuntimeName "npm"
         $version = Get-DoctorExactNodeVersion -NodePath $resolvedNodePath -ProjectRoot $Paths.Root -TimeoutSeconds 15
+        $npmVersion = Get-DoctorExactNpmVersion -NpmPath $resolvedNpmPath -ProjectRoot $Paths.Root -TimeoutSeconds 15
         return [pscustomobject]@{
             Version = $version
             Path = $resolvedNodePath
-            NpmPath = $Paths.LocalNpmPath
+            NpmPath = $resolvedNpmPath
+            NpmVersion = $npmVersion
             Source = "project-local"
         }
     }
@@ -287,11 +302,14 @@ function Get-DoctorNodeInfo {
         }
 
         $resolvedNodePath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $nodePath -ProjectRoot $Paths.Root -RuntimeName "Node"
+        $resolvedNpmPath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $npmPath -ProjectRoot $Paths.Root -RuntimeName "npm"
         $version = Get-DoctorExactNodeVersion -NodePath $resolvedNodePath -ProjectRoot $Paths.Root -TimeoutSeconds 15
+        $npmVersion = Get-DoctorExactNpmVersion -NpmPath $resolvedNpmPath -ProjectRoot $Paths.Root -TimeoutSeconds 15
         return [pscustomobject]@{
             Version = $version
             Path = $resolvedNodePath
-            NpmPath = $npmPath
+            NpmPath = $resolvedNpmPath
+            NpmVersion = $npmVersion
             Source = "path-node"
         }
     }

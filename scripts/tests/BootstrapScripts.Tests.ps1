@@ -866,6 +866,17 @@ function Get-BootstrapScriptTests {
             }
         },
         @{
+            Name = "Repository frontend commands load Vite config without an esbuild child process"
+            Body = {
+                $projectRoot = Split-Path -Parent (Split-Path -Parent (Get-BootstrapScriptPath))
+                $package = Get-Content -LiteralPath (Join-Path $projectRoot "frontend\package.json") -Raw | ConvertFrom-Json
+                foreach ($scriptName in @("dev", "build", "preview", "test", "test:run", "test:coverage")) {
+                    $command = [string]$package.scripts.$scriptName
+                    Assert-Contains -ExpectedSubstring "--configLoader native" -Actual $command -Message "Frontend script '$scriptName' should use native Vite config loading."
+                }
+            }
+        },
+        @{
             Name = "PlanOnly auto gpu emits the stable plan contract and does not mutate the fixture"
             Body = {
                 $fixture = New-BootstrapFixture
@@ -1321,6 +1332,46 @@ try {
             }
         },
         @{
+            Name = "SkipRuntimeDownload rejects a matching Node runtime when npm cannot execute"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $nodeRoot = Join-Path $fixture ".runtime\node"
+                    New-Item -ItemType Directory -Path $nodeRoot -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $nodeRoot "node.exe") -Value "fake-node" -Encoding ASCII
+                    Set-Content -LiteralPath (Join-Path $nodeRoot "npm.cmd") -Value "fake-npm" -Encoding ASCII
+
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+function Get-ExactNodeVersion {
+    param(`$NodePath)
+    '24.18.0'
+}
+function Test-NpmRuntime {
+    param(`$NpmPath, `$WorkingDirectory)
+    `$false
+}
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+`$manifest = Read-BootstrapManifest -Path (Join-Path '$escapedFixture' 'scripts\config\bootstrap-manifest.json')
+try {
+    `$null = Resolve-NodeRuntime -Paths `$paths -Manifest `$manifest -SkipDownload -DisablePathProbe
+    throw 'Expected unusable npm runtime failure.'
+} catch {
+    `$_.Exception.Message
+}
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Contains -ExpectedSubstring "npm" -Actual $result.StdOut.Trim().ToLowerInvariant() -Message "Unusable npm runtime failure should identify npm."
+                    Assert-False -Condition ($result.StdOut.Contains("Expected unusable npm runtime failure.")) -Message "A matching Node version must not hide an unusable npm runtime."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "Auto GPU fallback recreates the target venv and installs CPU cleanly"
             Body = {
                 $fixture = New-BootstrapFixture
@@ -1566,6 +1617,7 @@ function Ensure-ModelFiles {
     EnvExists = Test-Path -LiteralPath (Join-Path '$escapedFixture' 'backend\.env')
     VenvExists = Test-Path -LiteralPath (Join-Path '$escapedFixture' 'backend\.venv\Scripts\python.exe')
     ModelCount = @((Get-ChildItem -LiteralPath (Join-Path '$escapedFixture' 'models') -File -ErrorAction SilentlyContinue)).Count
+    SqliteParentExists = Test-Path -LiteralPath (Join-Path '$escapedFixture' 'backend\data') -PathType Container
     DoctorRan = Test-Path -LiteralPath (Join-Path '$escapedFixture' 'doctor-ran.txt')
     StartRan = Test-Path -LiteralPath (Join-Path '$escapedFixture' 'start-ran.txt')
     OutputSecretLeak = `$false
@@ -1577,9 +1629,47 @@ function Ensure-ModelFiles {
                     Assert-True -Condition $state.EnvExists -Message "Full success orchestration should generate backend/.env."
                     Assert-True -Condition $state.VenvExists -Message "Full success orchestration should leave a venv."
                     Assert-Equal -Expected 2 -Actual $state.ModelCount -Message "Full success orchestration should materialize the two default models."
+                    Assert-True -Condition $state.SqliteParentExists -Message "Full success orchestration should create the SQLite parent directory before doctor."
                     Assert-True -Condition $state.DoctorRan -Message "Full success orchestration should run doctor."
                     Assert-True -Condition $state.StartRan -Message "Full success orchestration should run start when requested."
                     Assert-False -Condition $state.OutputSecretLeak -Message "Full success orchestration must not leak secrets to output."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Long-running bootstrap commands use operation-specific bounded timeouts"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $optionalScript = Join-Path $fixture "scripts\optional.ps1"
+                    Set-Content -LiteralPath $optionalScript -Value "exit 0" -Encoding ASCII
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $escapedOptionalScript = $optionalScript.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+`$calls = New-Object System.Collections.Generic.List[object]
+function Invoke-CheckedCommand {
+    param(
+        [string]`$FilePath,
+        [string[]]`$ArgumentList = @(),
+        [string]`$WorkingDirectory,
+        [int]`$TimeoutSeconds = 30
+    )
+    `$calls.Add([pscustomobject]@{ Arguments = (`$ArgumentList -join ' '); Timeout = `$TimeoutSeconds })
+    [pscustomobject]@{ ExitCode = 0; StdOut = 'ok'; StdErr = '' }
+}
+Install-PythonRequirements -PythonPath 'python.exe' -RequirementsPath 'requirements.txt' -WorkingDirectory '$escapedFixture'
+Invoke-NpmInstall -NpmPath 'npm.cmd' -FrontendRoot '$escapedFixture'
+Invoke-OptionalScript -ScriptPath '$escapedOptionalScript' -ProjectRoot '$escapedFixture'
+[ordered]@{ Timeouts = @(`$calls | ForEach-Object { `$_.Timeout }) } | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected @(600, 3600, 300, 1800, 300) -Actual @($state.Timeouts | ForEach-Object { [int]$_ }) -Message "Long-running commands should upgrade packaging tools and use bounded operation-specific timeouts."
                 } finally {
                     Remove-TempFixture -Path $fixture
                 }
@@ -3626,6 +3716,46 @@ function Get-DoctorTorchInfo {
                     Assert-Equal -Expected "compute-device" -Actual $state.Name -Message "Compute-device result name mismatch."
                     Assert-Equal -Expected "PASS" -Actual $state.Status -Message "Compute-device result should PASS."
                     Assert-Contains -ExpectedSubstring "cpu" -Actual $state.Message.ToLowerInvariant() -Message "Compute-device message should resolve to CPU."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Doctor rejects a project-local Node runtime when npm cannot execute"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $nodeRoot = Join-Path $fixture ".runtime\node"
+                    New-Item -ItemType Directory -Path $nodeRoot -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $nodeRoot "node.exe") -Value "fixture-node" -Encoding ASCII
+                    Set-Content -LiteralPath (Join-Path $nodeRoot "npm.cmd") -Value "fixture-npm" -Encoding ASCII
+
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorExactNodeVersion {
+    param([string]`$NodePath, [string]`$ProjectRoot, [int]`$TimeoutSeconds)
+    '24.18.0'
+}
+function Get-DoctorExactNpmVersion {
+    param([string]`$NpmPath, [string]`$ProjectRoot, [int]`$TimeoutSeconds)
+    throw 'npm-probe-failed'
+}
+`$paths = Resolve-DoctorPaths -RootPath '$escapedFixture'
+`$manifest = Read-BootstrapManifest -Path `$paths.ManifestPath
+try {
+    `$null = Get-DoctorNodeInfo -Paths `$paths -Manifest `$manifest
+    throw 'Expected npm probe failure.'
+} catch {
+    `$_.Exception.Message
+}
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Contains -ExpectedSubstring "npm-probe-failed" -Actual $result.StdOut.Trim() -Message "Doctor should execute npm and surface a sanitized probe failure."
+                    Assert-False -Condition ($result.StdOut.Contains("Expected npm probe failure.")) -Message "Doctor must not accept an npm command that cannot execute."
                 } finally {
                     Remove-TempFixture -Path $fixture
                 }

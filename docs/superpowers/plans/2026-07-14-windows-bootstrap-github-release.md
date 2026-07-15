@@ -209,8 +209,8 @@ Use these exact runtime values:
 
 Add model records for:
 
-- `tt100k-yolo11s-reference42.pt`, SHA-256 `E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88`, local default detector; publication blocked until provenance and redistribution permission are documented.
-- `tt100k-yolo11n-common45.pt`, 5,488,602 bytes, SHA-256 `A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13`, optional detector subject to TT100K CC BY-NC and Ultralytics terms.
+- `tt100k-yolo11s-reference42.pt`, SHA-256 `E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88`, repository-owner-selected default detector subject to TT100K CC BY-NC and Ultralytics terms.
+- `tt100k-yolo11n-common45.pt` is explicitly excluded from this release.
 - `gtsrb-yolo11n-cls.pt`, 3,291,010 bytes, SHA-256 `323E5BD1B0DC5D1F6FBB4C487FAF2320DA0DF9C21132DD46C0C94FEE7B33B16C`, local default classifier pending provenance review.
 
 The default detector is 19,231,379 bytes. Candidate URLs follow
@@ -390,7 +390,7 @@ git commit -m "Add Windows diagnostics and process controls"
 
 ```powershell
 $trackedDocs = @('README.md', 'docs/windows-setup.md', 'docs/local-development.md', 'backend/.env.local.example')
-rg -n '[A-Z]:\\|local-dev-secret-change-before-production' $trackedDocs
+rg -n '[A-Z]:\\|forbidden-local-secret-placeholder' $trackedDocs
 ```
 
 Expected before editing: machine-specific/reference paths and a fixed development JWT are found.
@@ -411,12 +411,12 @@ Document URLs, GPU/CPU overrides, model choices, tests, project layout, known 42
 
 - [ ] **Step 4: Add full setup/troubleshooting and third-party notices**
 
-Cover proxy settings, download retry, hash mismatch, NVIDIA driver requirements, forced CPU install, missing models, port conflicts, logs, stop behavior, and clean reinstall. Document Ultralytics obligations separately from TT100K's official CC BY-NC terms and citation. Block any reference checkpoint whose training lineage and redistribution authorization are not documented.
+Cover proxy settings, download retry, hash mismatch, NVIDIA driver requirements, forced CPU install, missing models, port conflicts, logs, stop behavior, and clean reinstall. Document Ultralytics obligations separately from TT100K's official CC BY-NC terms and citation. Record that the repository owner selected the 42-class checkpoint for this non-commercial release.
 
 - [ ] **Step 5: Run portability and link checks**
 
 ```powershell
-rg -n '[A-Z]:\\|local-dev-secret-change-before-production' README.md docs/windows-setup.md docs/local-development.md backend/.env.local.example
+rg -n '[A-Z]:\\|forbidden-local-secret-placeholder' README.md docs/windows-setup.md docs/local-development.md backend/.env.local.example
 git diff --check
 ```
 
@@ -487,7 +487,6 @@ From the original workspace, copy without modifying the sources:
 
 ```powershell
 Copy-Item "$REFERENCE_MODEL_SOURCE\weights\best.pt" .runtime\release\models-v1\tt100k-yolo11s-reference42.pt
-Copy-Item "$PROJECT_ROOT\training\runs\tt100k_yolo11n_gpu\weights\best.pt" .runtime\release\models-v1\tt100k-yolo11n-common45.pt
 Copy-Item "$PROJECT_ROOT\training\runs\gtsrb_yolo11n_cls_gpu_final\weights\best.pt" .runtime\release\models-v1\gtsrb-yolo11n-cls.pt
 ```
 
@@ -589,7 +588,7 @@ gh repo edit Dman-s/Project1 --add-topic yolo11 --add-topic traffic-sign-detecti
 
 - [ ] **Step 7: Create the model release from approved assets only**
 
-Do not run this step until `docs/releases/models-v1.md` marks every selected asset as publishable and its provenance record is complete. Exclude `tt100k-yolo11s-reference42.pt` unless its redistribution gate has been resolved.
+Do not run this step until `docs/releases/models-v1.md` matches the selected 42-class detector and GTSRB classifier exactly. Do not upload the excluded common-45 checkpoint.
 
 ```powershell
 $APPROVED_MODEL_ASSETS = @('<path-to-approved-model-1>', '<path-to-approved-model-2>')

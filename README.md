@@ -29,7 +29,7 @@ TrafficAgent 是面向交通场景的本地交通标志识别应用。它用 Fas
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1 -Device auto -Start
 ```
 
-脚本会准备项目内运行时、后端虚拟环境、锁定的前端依赖、本地配置和默认模型，然后启动服务。模型附件的文件名、大小、哈希和发布资格以 [models-v1 发布契约](docs/releases/models-v1.md) 为准。当前 `reference42` 检查点缺少可核验的再分发来源，不能作为 GitHub Release 附件发布；在清单和发布资源调整完成前，默认模型下载步骤会失败。
+脚本会准备项目内运行时、后端虚拟环境、锁定的前端依赖、本地配置和默认模型，然后启动服务。默认检测器是 42 类 `reference42` 权重；模型附件的文件名、大小、哈希和适用条款以 [models-v1 发布契约](docs/releases/models-v1.md) 为准。
 
 启动后访问：
 
@@ -67,37 +67,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.
 
 | 文件 | 用途 | 状态 |
 | --- | --- | --- |
-| `models/tt100k-yolo11s-reference42.pt` | TT100K 42 类街景检测 + common-45 映射 | 本地运行默认；禁止发布，直至再分发来源完备 |
-| `models/gtsrb-yolo11n-cls.pt` | GTSRB 43 类裁剪图分类 | 本地运行默认；发布前核验训练与数据来源 |
-| `models/tt100k-yolo11n-common45.pt` | 项目训练的 common-45 检测器 | 可选；发布受 TT100K 数据集条款约束 |
+| `models/tt100k-yolo11s-reference42.pt` | TT100K 42 类街景检测 + common-45 映射 | 默认检测器；Release 自动下载 |
+| `models/gtsrb-yolo11n-cls.pt` | GTSRB 43 类裁剪图分类 | 默认分类器；Release 自动下载 |
 
-默认 42 类检测器没有训练 `ph5`、`w32`、`wo`，因此不能可靠检测这三类。common45 属于可选附件，不在 bootstrap 的默认下载列表中。仅当 `models-v1` Release 按发布契约完成授权核验并实际发布后，才可从清单下载并验证它：
-
-```powershell
-$manifest = Get-Content .\scripts\config\bootstrap-manifest.json -Raw -Encoding UTF8 | ConvertFrom-Json
-$model = $manifest.release.models | Where-Object filename -eq 'tt100k-yolo11n-common45.pt'
-New-Item -ItemType Directory -Path .\models -Force | Out-Null
-$partial = '.\models\tt100k-yolo11n-common45.pt.partial'
-$final = '.\models\tt100k-yolo11n-common45.pt'
-Invoke-WebRequest -UseBasicParsing -Uri $model.url -OutFile $partial
-$file = Get-Item -LiteralPath $partial
-$hash = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash
-if ($file.Length -ne [int64]$model.bytes -or $hash -ne [string]$model.sha256) {
-    throw 'common45 模型大小或 SHA-256 不匹配'
-}
-Move-Item -LiteralPath $partial -Destination $final -Force
-```
-
-验证通过后，在 `backend/.env` 中同时设置：
-
-```dotenv
-YOLO_MODEL_PATH=../models/tt100k-yolo11n-common45.pt
-YOLO_MODEL_NAME=tt100k-yolo11n-common45
-YOLO_MODEL_TYPE=yolov11n
-YOLO_CANONICALIZE_TT100K_CLASSES=true
-```
-
-然后重新运行诊断并重启。不要把旧基线指标当作该候选权重的实测性能。
+默认 42 类检测器没有训练 `ph5`、`w32`、`wo`，因此不能可靠检测这三类。项目训练的 common-45 权重不属于本发布版本，也不会被 bootstrap 下载。
 
 ## 测试
 
