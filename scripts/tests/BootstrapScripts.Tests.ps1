@@ -484,14 +484,17 @@ function New-StartFixture {
     $root = New-DoctorFixture
 
     foreach ($relativePath in @(
+        ".runtime\python",
         ".runtime\node",
         "frontend\node_modules\vite\bin"
     )) {
         New-Item -ItemType Directory -Path (Join-Path $root $relativePath) -Force | Out-Null
     }
 
+    [System.IO.File]::WriteAllText((Join-Path $root ".runtime\python\python.exe"), "fixture-base-python", [System.Text.Encoding]::ASCII)
     [System.IO.File]::WriteAllText((Join-Path $root ".runtime\node\node.exe"), "fixture-node", [System.Text.Encoding]::ASCII)
     [System.IO.File]::WriteAllText((Join-Path $root "frontend\node_modules\vite\bin\vite.js"), "module.exports = {};", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $root "backend\.venv\pyvenv.cfg"), "home = $(Join-Path $root '.runtime\python')`r`n", [System.Text.Encoding]::ASCII)
 
     return $root
 }
@@ -1664,6 +1667,7 @@ try {
                 foreach ($parameterName in @("ProjectRoot", "TimeoutSeconds")) {
                     Assert-True -Condition ($parameterNames -contains $parameterName) -Message "Missing required stop parameter '$parameterName'."
                 }
+                Assert-False -Condition ($ast.ParamBlock.Extent.Text.Contains('Join-Path $PSScriptRoot')) -Message "Stop must resolve its default project root after parameter binding."
 
                 $escapedStopPath = $stopScriptPath.Replace("'", "''")
                 $childScript = @"
@@ -1674,6 +1678,25 @@ try {
                 $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory (Split-Path -Parent $stopScriptPath)
                 Assert-Equal -Expected "dot-sourced" -Actual $result.StdOut.Trim() -Message "Stop script should not auto-run when dot-sourced."
                 Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Stop script emitted unexpected stderr when dot-sourced."
+            }
+        },
+        @{
+            Name = "Stop resolves an empty project root from the script directory"
+            Body = {
+                $fixture = New-TempFixture
+                try {
+                    $stopScriptPath = (Get-StopScriptPath).Replace("'", "''")
+                    $expectedRoot = (Split-Path -Parent (Split-Path -Parent (Get-StopScriptPath))).Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$stopScriptPath'
+Resolve-StopProjectRoot -ProjectRoot ''
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Equal -Expected $expectedRoot -Actual $result.StdOut.Trim() -Message "Stop should resolve its default root relative to stop.ps1, not the caller working directory."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
             }
         },
         @{
@@ -2240,7 +2263,7 @@ try {
                 Assert-Equal -Expected @("ProjectRoot", "BackendPort", "FrontendPort", "TimeoutSeconds") -Actual $parameterNames -Message "Start parameters mismatch."
 
                 $paramText = $ast.ParamBlock.Extent.Text
-                Assert-Contains -ExpectedSubstring '[string]$ProjectRoot = (Join-Path $PSScriptRoot "..")' -Actual $paramText -Message "Start ProjectRoot default mismatch."
+                Assert-False -Condition ($paramText.Contains('Join-Path $PSScriptRoot')) -Message "Start must resolve its default project root after parameter binding."
                 Assert-Contains -ExpectedSubstring '[int]$BackendPort = 8000' -Actual $paramText -Message "Start BackendPort default mismatch."
                 Assert-Contains -ExpectedSubstring '[int]$FrontendPort = 5173' -Actual $paramText -Message "Start FrontendPort default mismatch."
                 Assert-Contains -ExpectedSubstring '[int]$TimeoutSeconds = 90' -Actual $paramText -Message "Start TimeoutSeconds default mismatch."
@@ -2257,6 +2280,7 @@ try {
 
                 $frontendCode = New-StartFrontendCode -ProjectRoot "C:\project root" -Port 5123 -BackendPort 8123
                 Assert-False -Condition $frontendCode.Contains("configFile: false") -Message "Frontend launch must load vite.config.js."
+                Assert-Contains -ExpectedSubstring "configLoader: 'native'" -Actual $frontendCode -Message "Frontend launch should load the ESM config without an esbuild child process."
                 Assert-Contains -ExpectedSubstring "strictPort: true" -Actual $frontendCode -Message "Frontend launch must refuse fallback ports."
                 Assert-Contains -ExpectedSubstring "open: false" -Actual $frontendCode -Message "Frontend launch must not open a browser."
                 Assert-Contains -ExpectedSubstring "http://127.0.0.1:8123" -Actual $frontendCode -Message "Frontend proxy must target the selected backend port."
@@ -2282,6 +2306,77 @@ try {
                     Assert-False -Condition ([bool]$state.LogsExists) -Message "Dot-sourcing start.ps1 must not create the logs directory."
                     Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Dot-sourcing start.ps1 should keep stderr empty."
                 } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: direct invocation resolves the default project root after parameter binding"
+            Body = {
+                $result = Invoke-StartScriptProcess -ArgumentList @(
+                    "-BackendPort", "18123",
+                    "-FrontendPort", "18123",
+                    "-TimeoutSeconds", "5"
+                )
+
+                Assert-Equal -Expected 1 -Actual $result.ExitCode -Message "Equal ports should make direct start fail safely."
+                Assert-Contains -ExpectedSubstring "different" -Actual ($result.StdOut + $result.StdErr).ToLowerInvariant() -Message "Direct start should reach explicit port validation without a ProjectRoot argument."
+                Assert-False -Condition (($result.StdOut + $result.StdErr).Contains("Cannot bind argument to parameter 'Path'")) -Message "Direct start must not evaluate Join-Path against an empty PSScriptRoot during parameter binding."
+            }
+        },
+        @{
+            Name = "START: backend launch spec owns the base Python process"
+            Body = {
+                $fixture = New-StartFixture
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+                    $paths = Resolve-StartPaths -RootPath $fixture
+                    $basePythonPath = Get-StartBasePythonPath -RootPath $fixture -VenvPythonPath $paths.PythonPath
+                    $paths | Add-Member -NotePropertyName BasePythonPath -NotePropertyValue $basePythonPath
+
+                    $spec = New-StartLaunchSpec -RootPath $fixture -Paths $paths -Role backend -Port 18124 -BackendPort 18124
+                    Assert-Equal -Expected (Join-Path $fixture ".runtime\python\python.exe") -Actual $spec.FilePath -Message "Backend should launch the base Python process directly."
+                    Assert-Equal -Expected $paths.PythonPath -Actual ([string]$spec.EnvironmentVariables["__PYVENV_LAUNCHER__"]) -Message "Backend launch should preserve virtual-environment semantics for the child."
+                    Assert-Contains -ExpectedSubstring ([string]$spec.FilePath) -Actual ([string]$spec.IntendedCommandLine) -Message "Recorded command line should use the owned base Python executable."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: managed launcher scopes child environment overrides"
+            Body = {
+                $fixture = New-TempFixture
+                $launch = $null
+                $variableName = "PROJECT1_START_ENV_FIXTURE"
+                $previousValue = [Environment]::GetEnvironmentVariable($variableName, "Process")
+                try {
+                    $stdoutPath = Join-Path $fixture "environment.stdout.log"
+                    $stderrPath = Join-Path $fixture "environment.stderr.log"
+                    [Environment]::SetEnvironmentVariable($variableName, "parent-value", "Process")
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $launch = Start-ManagedProcess -LaunchSpec ([pscustomobject]@{
+                        FilePath = (Join-Path $PSHOME "powershell.exe")
+                        ArgumentList = @("-NoProfile", "-Command", "Write-Output `$env:$variableName")
+                        WorkingDirectory = $fixture
+                        StdOutLogPath = $stdoutPath
+                        StdErrLogPath = $stderrPath
+                        IntendedCommandLine = "environment-probe"
+                        EnvironmentVariables = @{ $variableName = "child-value" }
+                    })
+                    Assert-True -Condition $launch.Process.WaitForExit(10000) -Message "Environment probe child should exit."
+                    $launch.Process.Refresh()
+
+                    Assert-Equal -Expected "child-value" -Actual ([System.IO.File]::ReadAllText($stdoutPath).Trim()) -Message "Managed child should receive its scoped environment override."
+                    Assert-Equal -Expected "parent-value" -Actual ([Environment]::GetEnvironmentVariable($variableName, "Process")) -Message "Managed launch should restore the parent process environment."
+                } finally {
+                    if ($null -ne $launch) {
+                        try { $launch.Process.Dispose() } catch {}
+                    }
+                    [Environment]::SetEnvironmentVariable($variableName, $previousValue, "Process")
                     Remove-TempFixture -Path $fixture
                 }
             }
@@ -2491,6 +2586,25 @@ exit 0
                         $occupied.Listener.Stop()
                     }
                     Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: port status resolves the exact listener process id"
+            Body = {
+                $occupied = $null
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+                    $occupied = Start-TestTcpListener
+
+                    $status = Get-StartPortStatus -Port $occupied.Port
+                    Assert-True -Condition ([bool]$status.Occupied) -Message "Started TCP listener should be reported as occupied."
+                    Assert-Equal -Expected $PID -Actual ([int]$status.ProcessId) -Message "Port status should resolve the exact listener process id."
+                } finally {
+                    if ($null -ne $occupied) {
+                        $occupied.Listener.Stop()
+                    }
                 }
             }
         },
@@ -3068,6 +3182,32 @@ exit 0
                 $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory (Split-Path -Parent $doctorScriptPath)
                 Assert-Equal -Expected "dot-sourced" -Actual $result.StdOut.Trim() -Message "Doctor script should not auto-run when dot-sourced."
                 Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Doctor script emitted unexpected stderr when dot-sourced."
+            }
+        },
+        @{
+            Name = "Doctor disk facts use DriveInfo when PSDrive reports zero"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-Item {
+    param([string]`$LiteralPath, [switch]`$Force, [string]`$ErrorAction)
+    return [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = [int64]0 } }
+}
+`$facts = Get-DoctorSystemFacts -ProjectRoot '$escapedFixture'
+`$driveInfo = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot('$escapedFixture'))
+[ordered]@{ Actual = [int64]`$facts.FreeSpaceBytes; Expected = [int64]`$driveInfo.AvailableFreeSpace } | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $diskFacts = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected ([int64]$diskFacts.Expected) -Actual ([int64]$diskFacts.Actual) -Message "Doctor should use DriveInfo rather than an unreliable zero PSDrive.Free value."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
             }
         },
         @{

@@ -858,6 +858,64 @@ while ($true) {
             }
         },
         @{
+            Name = "Get-NativeProcessCommandLine reads a harmless child process command line"
+            Body = {
+                $fixture = New-TempFixture
+                $process = $null
+                try {
+                    $scriptPath = Join-Path $fixture "native-command-line-child.ps1"
+                    @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+while ($true) {
+    Start-Sleep -Milliseconds 250
+}
+'@ | Set-Content -LiteralPath $scriptPath -Encoding ASCII
+
+                    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $startInfo.FileName = (Join-Path $PSHOME "powershell.exe")
+                    $startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+                    $startInfo.UseShellExecute = $false
+                    $startInfo.CreateNoWindow = $true
+
+                    $process = New-Object System.Diagnostics.Process
+                    $process.StartInfo = $startInfo
+                    [void]$process.Start()
+                    Start-Sleep -Milliseconds 500
+
+                    $commandLine = Get-NativeProcessCommandLine -ProcessId $process.Id
+                    Assert-True -Condition (-not [string]::IsNullOrWhiteSpace([string]$commandLine)) -Message "Native process command line should not be empty."
+                    Assert-Contains -ExpectedSubstring $scriptPath -Actual ([string]$commandLine) -Message "Native process command line should contain the launched script path."
+                } finally {
+                    if ($null -ne $process) {
+                        try {
+                            if (-not $process.HasExited) {
+                                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {
+                        } finally {
+                            $process.Dispose()
+                        }
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Get-NativeTcpListenerProcessId resolves the current listener owner"
+            Body = {
+                $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+                try {
+                    $listener.Start()
+                    $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+                    $ownerPid = Get-NativeTcpListenerProcessId -Port $port
+                    Assert-Equal -Expected $PID -Actual $ownerPid -Message "Native TCP listener lookup should return the owning process id."
+                } finally {
+                    $listener.Stop()
+                }
+            }
+        },
+        @{
             Name = "Test-ProjectProcessIdentity rejects a command line mismatch when the actual command line is available"
             Body = {
                 $identity = Get-ProjectProcessIdentity
@@ -872,7 +930,7 @@ while ($true) {
             }
         },
         @{
-            Name = "Test-ProjectProcessIdentity rejects a required command line when the actual child command line is unavailable"
+            Name = "Get-ProjectProcessIdentity supplies a child command line for exact matching"
             Body = {
                 $fixture = New-TempFixture
                 $process = $null
@@ -898,16 +956,18 @@ while ($true) {
                     Start-Sleep -Seconds 1
 
                     $identity = Get-ProjectProcessIdentity -ProcessId $process.Id
-                    Assert-True -Condition ([string]::IsNullOrWhiteSpace([string]$identity.CommandLine)) -Message "This test requires the child command line to be unavailable."
+                    Assert-True -Condition (-not [string]::IsNullOrWhiteSpace([string]$identity.CommandLine)) -Message "Child command line should be available even when management APIs are unavailable."
 
                     $recorded = [pscustomobject]@{
                         Pid = $identity.Pid
                         ExecutablePath = $identity.ExecutablePath
                         StartTimeUtc = $identity.StartTimeUtc.ToString("o")
-                        CommandLine = "powershell.exe -NoProfile distinctive-project-role-backend"
+                        CommandLine = $identity.CommandLine
                     }
 
-                    Assert-False -Condition (Test-ProjectProcessIdentity -RecordedIdentity $recorded -ProcessId $process.Id) -Message "Identity comparison should fail closed when the required child command line is unavailable."
+                    Assert-True -Condition (Test-ProjectProcessIdentity -RecordedIdentity $recorded -ProcessId $process.Id) -Message "Identity comparison should accept the exact child command line."
+                    $recorded.CommandLine = ([string]$recorded.CommandLine) + " --mismatch"
+                    Assert-False -Condition (Test-ProjectProcessIdentity -RecordedIdentity $recorded -ProcessId $process.Id) -Message "Identity comparison should still reject a child command line mismatch."
                 } finally {
                     if ($null -ne $process) {
                         try {

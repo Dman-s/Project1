@@ -123,6 +123,8 @@ class LocalYoloDetector:
         if self._selected_device is None:
             if self.requested_device == "auto":
                 self._selected_device = "0" if self._cuda_available() else "cpu"
+            elif self.requested_device == "gpu":
+                self._selected_device = "0"
             else:
                 self._selected_device = self.requested_device
 

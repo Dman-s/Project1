@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot = (Join-Path $PSScriptRoot ".."),
+    [string]$ProjectRoot,
     [ValidateRange(1, 300)][int]$TimeoutSeconds = 15
 )
 
@@ -19,6 +19,10 @@ function Import-StopEnvironment {
 
 function Resolve-StopProjectRoot {
     param([AllowEmptyString()][string]$ProjectRoot)
+
+    if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+        $ProjectRoot = Join-Path $PSScriptRoot ".."
+    }
 
     $resolvedRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
     if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) {

@@ -150,6 +150,23 @@ def test_detector_auto_falls_back_to_cpu(tmp_path):
     assert detector.selected_device == "cpu"
 
 
+def test_detector_maps_explicit_gpu_mode_to_ultralytics_device_zero(tmp_path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    model = FakeModel()
+    detector = LocalYoloDetector(
+        model_path=model_path,
+        device="gpu",
+        model_factory=lambda _path: model,
+        cuda_available=lambda: True,
+    )
+
+    detector.predict(make_jpeg())
+
+    assert detector.selected_device == "0"
+    assert model.calls[0]["device"] == "0"
+
+
 def test_detector_exposes_checkpoint_class_names_lazily(tmp_path):
     model_path = tmp_path / "best.pt"
     model_path.write_bytes(b"checkpoint")

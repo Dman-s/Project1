@@ -142,13 +142,8 @@ function New-DoctorCheckResult {
 function Get-DoctorSystemFacts {
     param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
-    $item = Get-Item -LiteralPath $ProjectRoot -ErrorAction Stop
-    $freeSpaceBytes = if ($null -ne $item.PSDrive) {
-        [int64]$item.PSDrive.Free
-    } else {
-        $driveInfo = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($ProjectRoot))
-        [int64]$driveInfo.AvailableFreeSpace
-    }
+    $driveInfo = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($ProjectRoot))
+    $freeSpaceBytes = [int64]$driveInfo.AvailableFreeSpace
 
     return [pscustomobject]@{
         IsWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT

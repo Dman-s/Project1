@@ -85,6 +85,23 @@ def test_classifier_auto_falls_back_to_cpu(tmp_path):
     assert classifier.selected_device == "cpu"
 
 
+def test_classifier_maps_explicit_gpu_mode_to_ultralytics_device_zero(tmp_path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    model = FakeModel()
+    classifier = LocalSignClassifier(
+        model_path=model_path,
+        device="gpu",
+        model_factory=lambda _path: model,
+        cuda_available=lambda: True,
+    )
+
+    classifier.predict(make_jpeg())
+
+    assert classifier.selected_device == "0"
+    assert model.calls[0]["device"] == "0"
+
+
 def test_classifier_rejects_missing_checkpoint(tmp_path):
     classifier = LocalSignClassifier(
         model_path=tmp_path / "missing.pt",

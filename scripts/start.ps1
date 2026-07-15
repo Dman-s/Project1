@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot = (Join-Path $PSScriptRoot ".."),
+    [string]$ProjectRoot,
     [int]$BackendPort = 8000,
     [int]$FrontendPort = 5173,
     [int]$TimeoutSeconds = 90
@@ -69,6 +69,10 @@ function Assert-StartDirectInputs {
 function Resolve-StartProjectRoot {
     param([AllowEmptyString()][string]$ProjectRoot)
 
+    if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+        $ProjectRoot = Join-Path $PSScriptRoot ".."
+    }
+
     $resolvedRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
     if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) {
         throw "Project root does not exist."
@@ -90,6 +94,33 @@ function Resolve-StartContainedPath {
     }
 
     return $resolvedPath
+}
+
+function Get-StartBasePythonPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$VenvPythonPath
+    )
+
+    $venvRoot = Split-Path -Parent (Split-Path -Parent $VenvPythonPath)
+    $configPath = Resolve-StartContainedPath -RootPath $RootPath -Path (Join-Path $venvRoot "pyvenv.cfg") -Description "Python virtual environment config"
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        throw "Python virtual environment config is missing."
+    }
+    Assert-StopNoReparsePointTraversal -RootPath $RootPath -Path $configPath
+
+    $homeValues = @([System.IO.File]::ReadAllLines($configPath) | ForEach-Object {
+            if ($_ -match '^\s*home\s*=\s*(.+?)\s*$') {
+                $Matches[1]
+            }
+        })
+    if ($homeValues.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$homeValues[0])) {
+        throw "Python virtual environment config must contain exactly one home path."
+    }
+
+    $basePythonPath = Resolve-StartContainedPath -RootPath $RootPath -Path (Join-Path ([string]$homeValues[0]) "python.exe") -Description "Base Python"
+    Assert-StartLeafExecutable -RootPath $RootPath -Path $basePythonPath -Description "Base Python"
+    return $basePythonPath
 }
 
 function Resolve-StartPaths {
@@ -135,12 +166,21 @@ function Get-StartPortStatus {
     param([Parameter(Mandatory = $true)][int]$Port)
 
     $connections = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    if (@($connections).Count -gt 0) {
+        $owningProcess = @($connections | ForEach-Object { $_.OwningProcess } | Where-Object { $null -ne $_ -and [int]$_ -gt 0 } | Select-Object -First 1)
+        $processId = if ($owningProcess.Count -gt 0) { [int]$owningProcess[0] } else { Get-NativeTcpListenerProcessId -Port $Port }
+        return [pscustomobject]@{
+            Occupied = $true
+            ProcessId = $processId
+        }
+    }
+
     if (@($connections).Count -eq 0) {
         $listeners = @([System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq $Port })
         if ($listeners.Count -gt 0) {
             return [pscustomobject]@{
                 Occupied = $true
-                ProcessId = $null
+                ProcessId = Get-NativeTcpListenerProcessId -Port $Port
             }
         }
 
@@ -148,11 +188,6 @@ function Get-StartPortStatus {
             Occupied = $false
             ProcessId = $null
         }
-    }
-
-    return [pscustomobject]@{
-        Occupied = $true
-        ProcessId = [int]$connections[0].OwningProcess
     }
 }
 
@@ -252,6 +287,7 @@ const { createServer } = require('vite');
 (async () => {
   const server = await createServer({
     root: '.',
+    configLoader: 'native',
     server: {
       host: '127.0.0.1',
       port: $Port,
@@ -330,12 +366,14 @@ function New-StartLaunchSpec {
 
     if ($Role -eq "backend") {
         $argumentList = @("-c", (New-StartBackendCode -ProjectRoot $RootPath -Port $Port))
-        $filePath = $Paths.PythonPath
+        $filePath = $Paths.BasePythonPath
         $workingDirectory = $Paths.BackendRoot
+        $environmentVariables = @{ "__PYVENV_LAUNCHER__" = $Paths.PythonPath }
     } else {
         $argumentList = @("-e", (New-StartFrontendCode -ProjectRoot $RootPath -Port $Port -BackendPort $BackendPort))
         $filePath = $Paths.NodePath
         $workingDirectory = $Paths.FrontendRoot
+        $environmentVariables = @{}
     }
 
     $intendedCommandLine = ($filePath + " " + (@($argumentList | ForEach-Object { ConvertTo-StartCommandArgument -Argument $_ }) -join " ")).Trim()
@@ -348,6 +386,7 @@ function New-StartLaunchSpec {
         StdOutLogPath = $stdoutLogPath
         StdErrLogPath = $stderrLogPath
         IntendedCommandLine = $intendedCommandLine
+        EnvironmentVariables = $environmentVariables
         ProjectRoot = $RootPath
         Port = $Port
     }
@@ -601,13 +640,34 @@ function Start-ManagedProcess {
 
     $arguments = @($LaunchSpec.ArgumentList | ForEach-Object { ConvertTo-StartCommandArgument -Argument $_ }) -join " "
     Initialize-StartNativeLauncher
-    $process = [Project1.Windows.DetachedProcessLauncher]::Launch(
-        [string]$LaunchSpec.FilePath,
-        [string]$arguments,
-        [string]$LaunchSpec.WorkingDirectory,
-        [string]$LaunchSpec.StdOutLogPath,
-        [string]$LaunchSpec.StdErrLogPath
-    )
+    $environmentVariables = if ($null -ne $LaunchSpec.PSObject.Properties["EnvironmentVariables"] -and $null -ne $LaunchSpec.EnvironmentVariables) {
+        $LaunchSpec.EnvironmentVariables
+    } else {
+        @{}
+    }
+    $previousEnvironment = @{}
+    try {
+        foreach ($entry in $environmentVariables.GetEnumerator()) {
+            $name = [string]$entry.Key
+            if ([string]::IsNullOrWhiteSpace($name) -or $name.Contains("=")) {
+                throw "Managed process environment variable name is invalid."
+            }
+            $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+            [Environment]::SetEnvironmentVariable($name, [string]$entry.Value, "Process")
+        }
+
+        $process = [Project1.Windows.DetachedProcessLauncher]::Launch(
+            [string]$LaunchSpec.FilePath,
+            [string]$arguments,
+            [string]$LaunchSpec.WorkingDirectory,
+            [string]$LaunchSpec.StdOutLogPath,
+            [string]$LaunchSpec.StdErrLogPath
+        )
+    } finally {
+        foreach ($entry in $previousEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable([string]$entry.Key, $entry.Value, "Process")
+        }
+    }
 
     return [pscustomobject]@{
         Process = $process
@@ -890,6 +950,8 @@ function Invoke-StartMain {
     }
 
     Assert-StartLeafExecutable -RootPath $resolvedRoot -Path $paths.PythonPath -Description "Backend Python"
+    $basePythonPath = Get-StartBasePythonPath -RootPath $resolvedRoot -VenvPythonPath $paths.PythonPath
+    $paths | Add-Member -NotePropertyName BasePythonPath -NotePropertyValue $basePythonPath
     Assert-StartLeafExecutable -RootPath $resolvedRoot -Path $paths.NodePath -Description "Frontend Node"
     Assert-StartLeafExecutable -RootPath $resolvedRoot -Path $paths.ViteEntryPath -Description "Frontend Vite entry"
 

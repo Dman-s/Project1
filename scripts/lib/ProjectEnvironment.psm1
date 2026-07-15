@@ -503,6 +503,224 @@ function Test-PathInsideRoot {
     return $normalizedCandidate.StartsWith($normalizedRoot + "\", [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Initialize-ProjectProcessNativeMethods {
+    $typeName = New-Object System.Management.Automation.PSTypeName("Project1.Windows.ProcessIntrospection")
+    if ($null -ne $typeName.Type) {
+        return
+    }
+
+    $source = @'
+using System;
+using System.Net;
+using System.Runtime.InteropServices;
+
+namespace Project1.Windows
+{
+    public static class ProcessIntrospection
+    {
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const int PROCESS_COMMAND_LINE_INFORMATION = 60;
+        private const int AF_INET = 2;
+        private const int TCP_TABLE_OWNER_PID_LISTENER = 3;
+        private const uint ERROR_INSUFFICIENT_BUFFER = 122;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UNICODE_STRING
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MIB_TCPROW_OWNER_PID
+        {
+            public uint State;
+            public uint LocalAddress;
+            public uint LocalPort;
+            public uint RemoteAddress;
+            public uint RemotePort;
+            public uint OwningPid;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint processAccess, bool inheritHandle, int processId);
+
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(
+            IntPtr processHandle,
+            int processInformationClass,
+            IntPtr processInformation,
+            int processInformationLength,
+            out int returnLength);
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(
+            IntPtr tcpTable,
+            ref int size,
+            bool order,
+            int ipVersion,
+            int tableClass,
+            uint reserved);
+
+        public static string ReadCommandLine(int processId)
+        {
+            IntPtr processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+            if (processHandle == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                int requiredLength;
+                NtQueryInformationProcess(
+                    processHandle,
+                    PROCESS_COMMAND_LINE_INFORMATION,
+                    IntPtr.Zero,
+                    0,
+                    out requiredLength);
+                if (requiredLength <= 0)
+                {
+                    return null;
+                }
+
+                buffer = Marshal.AllocHGlobal(requiredLength);
+                int returnedLength;
+                int status = NtQueryInformationProcess(
+                    processHandle,
+                    PROCESS_COMMAND_LINE_INFORMATION,
+                    buffer,
+                    requiredLength,
+                    out returnedLength);
+                if (status != 0)
+                {
+                    return null;
+                }
+
+                UNICODE_STRING commandLine = (UNICODE_STRING)Marshal.PtrToStructure(
+                    buffer,
+                    typeof(UNICODE_STRING));
+                if (commandLine.Buffer == IntPtr.Zero || commandLine.Length == 0)
+                {
+                    return null;
+                }
+
+                return Marshal.PtrToStringUni(commandLine.Buffer, commandLine.Length / 2);
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+                CloseHandle(processHandle);
+            }
+        }
+
+        public static int ReadTcpListenerProcessId(int port)
+        {
+            int size = 0;
+            uint result = GetExtendedTcpTable(
+                IntPtr.Zero,
+                ref size,
+                false,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0);
+            if (result != ERROR_INSUFFICIENT_BUFFER || size <= 0)
+            {
+                return 0;
+            }
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                int allocatedSize = size;
+                IntPtr buffer = Marshal.AllocHGlobal(allocatedSize);
+                try
+                {
+                    result = GetExtendedTcpTable(
+                        buffer,
+                        ref size,
+                        false,
+                        AF_INET,
+                        TCP_TABLE_OWNER_PID_LISTENER,
+                        0);
+                    if (result == ERROR_INSUFFICIENT_BUFFER) {
+                        if (size <= allocatedSize) {
+                            size = checked(allocatedSize * 2);
+                        }
+                        continue;
+                    }
+                    if (result != 0 || allocatedSize < sizeof(int))
+                    {
+                        return 0;
+                    }
+
+                    int rowCount = Marshal.ReadInt32(buffer);
+                    int rowSize = Marshal.SizeOf(typeof(MIB_TCPROW_OWNER_PID));
+                    long requiredSize = sizeof(int) + ((long)rowCount * rowSize);
+                    if (rowCount < 0 || requiredSize > allocatedSize)
+                    {
+                        return 0;
+                    }
+
+                    IntPtr rowPointer = IntPtr.Add(buffer, sizeof(int));
+                    for (int index = 0; index < rowCount; index++)
+                    {
+                        MIB_TCPROW_OWNER_PID row = (MIB_TCPROW_OWNER_PID)Marshal.PtrToStructure(
+                            rowPointer,
+                            typeof(MIB_TCPROW_OWNER_PID));
+                        int localPort = (ushort)IPAddress.NetworkToHostOrder((short)row.LocalPort);
+                        if (localPort == port)
+                        {
+                            return (int)row.OwningPid;
+                        }
+
+                        rowPointer = IntPtr.Add(rowPointer, rowSize);
+                    }
+
+                    return 0;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+
+            return 0;
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+}
+
+function Get-NativeProcessCommandLine {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    Initialize-ProjectProcessNativeMethods
+    return [Project1.Windows.ProcessIntrospection]::ReadCommandLine($ProcessId)
+}
+
+function Get-NativeTcpListenerProcessId {
+    param([Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port)
+
+    Initialize-ProjectProcessNativeMethods
+    $processId = [Project1.Windows.ProcessIntrospection]::ReadTcpListenerProcessId($Port)
+    if ($processId -le 0) {
+        return $null
+    }
+
+    return $processId
+}
+
 function Get-ProjectProcessIdentity {
     param([Alias("Pid")][int]$ProcessId = $PID)
 
@@ -525,6 +743,14 @@ function Get-ProjectProcessIdentity {
         if ($null -ne $record) {
             $executablePath = Get-IdentityValue -Object $record -Names @("ExecutablePath")
             $commandLine = Get-IdentityValue -Object $record -Names @("CommandLine")
+        }
+
+        if ([string]::IsNullOrWhiteSpace([string]$commandLine)) {
+            try {
+                $commandLine = Get-NativeProcessCommandLine -ProcessId $ProcessId
+            } catch {
+                $commandLine = $null
+            }
         }
     }
 
@@ -678,6 +904,8 @@ Export-ModuleMember -Function @(
     "New-SecureToken",
     "New-LocalEnvContent",
     "Test-PathInsideRoot",
+    "Get-NativeProcessCommandLine",
+    "Get-NativeTcpListenerProcessId",
     "Get-ProjectProcessIdentity",
     "Test-ProjectProcessIdentity",
     "Invoke-CheckedCommand"
