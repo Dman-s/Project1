@@ -113,7 +113,7 @@ function Read-StopStateRecord {
     )
 
     try {
-        $raw = Get-Content -LiteralPath $StatePath -Raw -ErrorAction Stop
+        $raw = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 -ErrorAction Stop
         $record = $raw | ConvertFrom-Json -ErrorAction Stop
     } catch {
         throw "$Role state record is invalid."

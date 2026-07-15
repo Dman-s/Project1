@@ -283,6 +283,80 @@ function Invoke-StopScriptProcess {
     }
 }
 
+function Invoke-StartScriptProcess {
+    param(
+        [string[]]$ArgumentList = @(),
+        [string]$ProjectRoot,
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 30
+    )
+
+    $startScriptPath = Get-StartScriptPath
+    $powershellPath = Join-Path $PSHOME "powershell.exe"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powershellPath
+
+    $allArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $startScriptPath
+    )
+
+    if ($ProjectRoot) {
+        $allArguments += @("-ProjectRoot", $ProjectRoot)
+    }
+
+    if ($ArgumentList) {
+        $allArguments += $ArgumentList
+    }
+
+    $quotedArguments = foreach ($argument in $allArguments) {
+        if ($argument -notmatch '[\s"]') {
+            $argument
+            continue
+        }
+
+        '"' + $argument.Replace('"', '\"') + '"'
+    }
+
+    $startInfo.Arguments = $quotedArguments -join " "
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+
+    try {
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                }
+            } catch {
+            }
+
+            [void]$process.WaitForExit(5000)
+            throw "start.ps1 timed out after $TimeoutSeconds seconds."
+        }
+
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut = $stdoutTask.GetAwaiter().GetResult()
+            StdErr = $stderrTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function New-NodeRuntimeArchive {
     param(
         [Parameter(Mandatory = $true)][string]$FixtureRoot,
@@ -406,6 +480,22 @@ function New-DoctorFixture {
     return $root
 }
 
+function New-StartFixture {
+    $root = New-DoctorFixture
+
+    foreach ($relativePath in @(
+        ".runtime\node",
+        "frontend\node_modules\vite\bin"
+    )) {
+        New-Item -ItemType Directory -Path (Join-Path $root $relativePath) -Force | Out-Null
+    }
+
+    [System.IO.File]::WriteAllText((Join-Path $root ".runtime\node\node.exe"), "fixture-node", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $root "frontend\node_modules\vite\bin\vite.js"), "module.exports = {};", [System.Text.Encoding]::ASCII)
+
+    return $root
+}
+
 function New-StopFixture {
     $root = New-BootstrapFixture
     New-Item -ItemType Directory -Path (Join-Path $root ".runtime\state") -Force | Out-Null
@@ -439,7 +529,8 @@ function Start-StopTestChildProcess {
     param(
         [Parameter(Mandatory = $true)][string]$ProjectRoot,
         [Parameter(Mandatory = $true)][ValidateSet("backend", "frontend")][string]$Role,
-        [string]$Secret = "SENTINEL-STOP-SECRET"
+        [string]$Secret = "SENTINEL-STOP-SECRET",
+        [switch]$SkipIdentityCapture
     )
 
     $fixture = New-TempFixture
@@ -488,31 +579,33 @@ while (`$true) {
     [void]$process.Start()
 
     $identity = $null
-    $deadline = [datetime]::UtcNow.AddSeconds(10)
-    while ([datetime]::UtcNow -lt $deadline) {
-        if ($process.HasExited) {
-            $process.Dispose()
-            throw "Stop test child exited before identity capture."
-        }
-
-        try {
-            $identity = Get-ProjectProcessIdentity -ProcessId $process.Id
-            if ($null -ne $identity) {
-                break
+    if (-not $SkipIdentityCapture) {
+        $deadline = [datetime]::UtcNow.AddSeconds(10)
+        while ([datetime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) {
+                $process.Dispose()
+                throw "Stop test child exited before identity capture."
             }
-        } catch {
+
+            try {
+                $identity = Get-ProjectProcessIdentity -ProcessId $process.Id
+                if ($null -ne $identity) {
+                    break
+                }
+            } catch {
+            }
+
+            Start-Sleep -Milliseconds 200
         }
 
-        Start-Sleep -Milliseconds 200
-    }
-
-    if ($null -eq $identity) {
-        try {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        } catch {
+        if ($null -eq $identity) {
+            try {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            } catch {
+            }
+            $process.Dispose()
+            throw "Stop test child identity was unavailable."
         }
-        $process.Dispose()
-        throw "Stop test child identity was unavailable."
     }
 
     return [pscustomobject]@{
@@ -526,6 +619,41 @@ while (`$true) {
         Identity = $identity
         IntendedCommandLine = "$powershellPath $($startInfo.Arguments)"
     }
+}
+
+function New-StartSyntheticIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$ProcessHandle,
+        [string]$CommandLine = ""
+    )
+
+    $executablePath = [string]$ProcessHandle.StartInfo.FileName
+    if ([string]::IsNullOrWhiteSpace($executablePath)) {
+        $executablePath = [string]$ProcessHandle.Path
+    }
+
+    return [pscustomobject]@{
+        Pid = [int]$ProcessHandle.Id
+        ExecutablePath = $executablePath
+        StartTimeUtc = ([datetime]$ProcessHandle.StartTime).ToUniversalTime()
+        CommandLine = [string]$CommandLine
+    }
+}
+
+function New-StartTrackedProcessHandle {
+    param([Parameter(Mandatory = $true)]$ProcessHandle)
+
+    $tracker = [pscustomobject]@{ Disposed = $false }
+    $tracked = [pscustomobject]@{
+        Id = [int]$ProcessHandle.Id
+        HasExited = $false
+        StartInfo = $ProcessHandle.StartInfo
+        StartTime = $ProcessHandle.StartTime
+        Path = $ProcessHandle.StartInfo.FileName
+        Tracker = $tracker
+    }
+    $tracked | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Tracker.Disposed = $true }
+    return $tracked
 }
 
 function Stop-StopTestChildProcess {
@@ -691,6 +819,15 @@ function Start-TestTcpListener {
     return [pscustomobject]@{
         Listener = $listener
         Port = ([int]$listener.LocalEndpoint.Port)
+    }
+}
+
+function Get-TestTcpPort {
+    $reservation = Start-TestTcpListener
+    try {
+        return $reservation.Port
+    } finally {
+        $reservation.Listener.Stop()
     }
 }
 
@@ -2090,6 +2227,800 @@ try {
             }
         },
         @{
+            Name = "START: script AST parses cleanly, exposes expected parameters, and dot-sources idly"
+            Body = {
+                $startScriptPath = Get-StartScriptPath
+                $tokens = $null
+                $parseErrors = $null
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($startScriptPath, [ref]$tokens, [ref]$parseErrors)
+
+                Assert-Equal -Expected 0 -Actual $parseErrors.Count -Message "Start script parse errors were found."
+
+                $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+                Assert-Equal -Expected @("ProjectRoot", "BackendPort", "FrontendPort", "TimeoutSeconds") -Actual $parameterNames -Message "Start parameters mismatch."
+
+                $paramText = $ast.ParamBlock.Extent.Text
+                Assert-Contains -ExpectedSubstring '[string]$ProjectRoot = (Join-Path $PSScriptRoot "..")' -Actual $paramText -Message "Start ProjectRoot default mismatch."
+                Assert-Contains -ExpectedSubstring '[int]$BackendPort = 8000' -Actual $paramText -Message "Start BackendPort default mismatch."
+                Assert-Contains -ExpectedSubstring '[int]$FrontendPort = 5173' -Actual $paramText -Message "Start FrontendPort default mismatch."
+                Assert-Contains -ExpectedSubstring '[int]$TimeoutSeconds = 90' -Actual $paramText -Message "Start TimeoutSeconds default mismatch."
+                Assert-False -Condition ($paramText.Contains("ValidateRange")) -Message "Start parameter validation must occur in direct flow, not param attributes."
+
+                $startRoot = Split-Path -Parent (Split-Path -Parent $startScriptPath)
+                . $startScriptPath -ProjectRoot $startRoot
+                try {
+                    Assert-StartDirectInputs -BackendPort 8123 -FrontendPort 8123 -TimeoutSeconds 30
+                    throw "Expected equal-port rejection."
+                } catch {
+                    Assert-Contains -ExpectedSubstring "different" -Actual $_.Exception.Message.ToLowerInvariant() -Message "Backend and frontend ports must differ."
+                }
+
+                $frontendCode = New-StartFrontendCode -ProjectRoot "C:\project root" -Port 5123 -BackendPort 8123
+                Assert-False -Condition $frontendCode.Contains("configFile: false") -Message "Frontend launch must load vite.config.js."
+                Assert-Contains -ExpectedSubstring "strictPort: true" -Actual $frontendCode -Message "Frontend launch must refuse fallback ports."
+                Assert-Contains -ExpectedSubstring "open: false" -Actual $frontendCode -Message "Frontend launch must not open a browser."
+                Assert-Contains -ExpectedSubstring "http://127.0.0.1:8123" -Actual $frontendCode -Message "Frontend proxy must target the selected backend port."
+
+                $fixture = New-StartFixture
+                try {
+                    $startScriptLiteral = $startScriptPath.Replace("'", "''")
+                    $fixtureLiteral = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$startScriptLiteral'
+[ordered]@{
+    HasInvokeStartMain = [bool](Get-Command Invoke-StartMain -ErrorAction SilentlyContinue)
+    StdOut = ''
+    StateExists = Test-Path -LiteralPath (Join-Path '$fixtureLiteral' '.runtime\state')
+    LogsExists = Test-Path -LiteralPath (Join-Path '$fixtureLiteral' '.runtime\logs')
+} | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-True -Condition ([bool]$state.HasInvokeStartMain) -Message "Dot-sourcing start.ps1 should expose Invoke-StartMain."
+                    Assert-False -Condition ([bool]$state.StateExists) -Message "Dot-sourcing start.ps1 must not create the state directory."
+                    Assert-False -Condition ([bool]$state.LogsExists) -Message "Dot-sourcing start.ps1 must not create the logs directory."
+                    Assert-Equal -Expected "" -Actual $result.StdErr.Trim() -Message "Dot-sourcing start.ps1 should keep stderr empty."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: managed launcher redirects logs without parent event jobs"
+            Body = {
+                $fixture = New-StartFixture
+                $launch = $null
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $logsRoot = Join-Path $fixture ".runtime\logs"
+                    New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+                    $stdoutPath = Join-Path $logsRoot "launcher.stdout.log"
+                    $stderrPath = Join-Path $logsRoot "launcher.stderr.log"
+                    $marker = "START-LAUNCHER-REDIRECT-MARKER"
+                    $childCode = "Write-Output '$marker'; Start-Sleep -Seconds 10"
+                    $environmentBefore = [System.Environment]::GetEnvironmentVariables()
+                    $pathSnapshotBefore = @($environmentBefore.Keys | Where-Object {
+                            ([string]$_).Equals("PATH", [System.StringComparison]::OrdinalIgnoreCase)
+                        } | ForEach-Object { "$_=$($environmentBefore[$_])" } | Sort-Object)
+                    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    $launch = Start-ManagedProcess -LaunchSpec ([pscustomobject]@{
+                        FilePath = (Join-Path $PSHOME "powershell.exe")
+                        ArgumentList = @("-NoProfile", "-Command", $childCode)
+                        WorkingDirectory = $fixture
+                        StdOutLogPath = $stdoutPath
+                        StdErrLogPath = $stderrPath
+                        IntendedCommandLine = "launcher-probe"
+                    })
+                    $stopwatch.Stop()
+
+                    Assert-True -Condition ($stopwatch.Elapsed.TotalSeconds -lt 3) -Message "Managed launch should return without waiting for the child."
+                    Assert-Equal -Expected "Project1.Windows.OwnedProcess" -Actual $launch.Process.GetType().FullName -Message "Managed launch must retain the exact CreateProcess handle instead of reopening by PID."
+                    Assert-True -Condition ($null -eq $launch.PSObject.Properties["StdOutRegistration"]) -Message "Managed launch must not retain a parent stdout event subscription."
+                    Assert-True -Condition ($null -eq $launch.PSObject.Properties["StdErrRegistration"]) -Message "Managed launch must not retain a parent stderr event subscription."
+                    Assert-True -Condition ($null -eq $launch.PSObject.Properties["StdOutWriter"]) -Message "Managed launch must not retain a parent stdout writer."
+                    Assert-True -Condition ($null -eq $launch.PSObject.Properties["StdErrWriter"]) -Message "Managed launch must not retain a parent stderr writer."
+                    $environmentAfter = [System.Environment]::GetEnvironmentVariables()
+                    $pathSnapshotAfter = @($environmentAfter.Keys | Where-Object {
+                            ([string]$_).Equals("PATH", [System.StringComparison]::OrdinalIgnoreCase)
+                        } | ForEach-Object { "$_=$($environmentAfter[$_])" } | Sort-Object)
+                    Assert-Equal -Expected $pathSnapshotBefore -Actual $pathSnapshotAfter -Message "Managed launch must not mutate the caller PATH environment."
+
+                    $deadline = [datetime]::UtcNow.AddSeconds(3)
+                    $logContent = [string](Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue)
+                    while ([datetime]::UtcNow -lt $deadline -and -not ($logContent -like "*$marker*")) {
+                        Start-Sleep -Milliseconds 100
+                        $logContent = [string](Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue)
+                    }
+                    Assert-Contains -ExpectedSubstring $marker -Actual (Get-Content -LiteralPath $stdoutPath -Raw) -Message "Managed launch should redirect stdout directly to its log."
+                } finally {
+                    if ($null -ne $launch) {
+                        Stop-StartedProcessHandle -Started $launch -TimeoutSeconds 5
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: detached child keeps logging after starter process exits"
+            Body = {
+                $fixture = New-StartFixture
+                $parent = $null
+                $childProcess = $null
+                try {
+                    $logsRoot = Join-Path $fixture ".runtime\logs"
+                    New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+                    $stdoutPath = Join-Path $logsRoot "detached.stdout.log"
+                    $stderrPath = Join-Path $logsRoot "detached.stderr.log"
+                    $pidPath = Join-Path $fixture ".runtime\detached.pid"
+                    $parentScriptPath = Join-Path $fixture "detached-parent.ps1"
+                    $startScriptLiteral = (Get-StartScriptPath).Replace("'", "''")
+                    $fixtureLiteral = $fixture.Replace("'", "''")
+                    $stdoutLiteral = $stdoutPath.Replace("'", "''")
+                    $stderrLiteral = $stderrPath.Replace("'", "''")
+                    $pidLiteral = $pidPath.Replace("'", "''")
+                    $childCode = "Write-Output 'DETACHED-FIRST'; Start-Sleep -Seconds 2; Write-Output 'DETACHED-SECOND'; Start-Sleep -Seconds 10"
+                    $childCodeLiteral = $childCode.Replace("'", "''")
+                    $parentScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$startScriptLiteral' -ProjectRoot '$fixtureLiteral'
+Initialize-StartEnvironment
+`$launch = Start-ManagedProcess -LaunchSpec ([pscustomobject]@{
+    FilePath = (Join-Path `$PSHOME 'powershell.exe')
+    ArgumentList = @('-NoProfile', '-Command', '$childCodeLiteral')
+    WorkingDirectory = '$fixtureLiteral'
+    StdOutLogPath = '$stdoutLiteral'
+    StdErrLogPath = '$stderrLiteral'
+    IntendedCommandLine = 'detached-boundary-probe'
+})
+[System.IO.File]::WriteAllText('$pidLiteral', [string]`$launch.Process.Id, [System.Text.Encoding]::ASCII)
+`$launch.Process.Dispose()
+exit 0
+"@
+                    Set-Content -LiteralPath $parentScriptPath -Value $parentScript -Encoding ASCII
+
+                    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $startInfo.FileName = Join-Path $PSHOME "powershell.exe"
+                    $startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File " + (ConvertTo-StopTestArgument -Argument $parentScriptPath)
+                    $startInfo.WorkingDirectory = $fixture
+                    $startInfo.UseShellExecute = $false
+                    $startInfo.CreateNoWindow = $true
+                    $parent = New-Object System.Diagnostics.Process
+                    $parent.StartInfo = $startInfo
+                    [void]$parent.Start()
+                    Assert-True -Condition $parent.WaitForExit(10000) -Message "Starter process should exit while the detached child remains alive."
+                    Assert-Equal -Expected 0 -Actual $parent.ExitCode -Message "Detached-process parent should exit successfully."
+
+                    Assert-True -Condition (Test-Path -LiteralPath $pidPath -PathType Leaf) -Message "Starter should publish the detached child PID."
+                    $childProcessId = [int](Get-Content -LiteralPath $pidPath -Raw)
+                    $childProcess = Get-Process -Id $childProcessId -ErrorAction Stop
+                    Assert-False -Condition $childProcess.HasExited -Message "Detached child should still run after its starter exits."
+
+                    $deadline = [datetime]::UtcNow.AddSeconds(5)
+                    $logContent = [string](Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue)
+                    while ([datetime]::UtcNow -lt $deadline -and -not ($logContent -like "*DETACHED-SECOND*")) {
+                        Start-Sleep -Milliseconds 100
+                        $logContent = [string](Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue)
+                    }
+                    Assert-Contains -ExpectedSubstring "DETACHED-FIRST" -Actual $logContent -Message "Detached child should write its first log line."
+                    Assert-Contains -ExpectedSubstring "DETACHED-SECOND" -Actual $logContent -Message "Detached child logging should continue after the starter exits."
+                } finally {
+                    if ($null -ne $childProcess) {
+                        try {
+                            if (-not $childProcess.HasExited) {
+                                $childProcess.Kill()
+                                [void]$childProcess.WaitForExit(5000)
+                            }
+                        } finally {
+                            $childProcess.Dispose()
+                        }
+                    }
+                    if ($null -ne $parent) {
+                        $parent.Dispose()
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: doctor failure prevents state or log mutation and never launches processes"
+            Body = {
+                $fixture = New-StartFixture
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $launched = $false
+                    $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 1; StdOut = "[FAIL] setup"; StdErr = "" } }
+                    $launcher = {
+                        param($LaunchSpec)
+                        $script:launched = $true
+                        throw "launcher-should-not-run"
+                    }.GetNewClosure()
+
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort (Get-TestTcpPort) -FrontendPort (Get-TestTcpPort) -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher | Out-Null
+                        throw "Expected doctor failure."
+                    } catch {
+                        Assert-Contains -ExpectedSubstring "doctor" -Actual $_.Exception.Message.ToLowerInvariant() -Message "Doctor failure should mention doctor."
+                    }
+
+                    Assert-False -Condition $launched -Message "Doctor failure must prevent any process launch."
+                    Assert-False -Condition (Test-Path -LiteralPath (Join-Path $fixture ".runtime\state")) -Message "Doctor failure must not create the state directory."
+                    Assert-False -Condition (Test-Path -LiteralPath (Join-Path $fixture ".runtime\logs")) -Message "Doctor failure must not create the logs directory."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: unrelated occupied random port rejects and the listener survives"
+            Body = {
+                $fixture = New-StartFixture
+                $occupied = $null
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $occupied = Start-TestTcpListener
+                    $frontendPort = Get-TestTcpPort
+                    $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                    $launcher = { param($LaunchSpec) throw "launcher-should-not-run" }
+
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort $occupied.Port -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher | Out-Null
+                        throw "Expected occupied-port failure."
+                    } catch {
+                        $message = $_.Exception.Message.ToLowerInvariant()
+                        Assert-Contains -ExpectedSubstring "backend" -Actual $message -Message "Occupied backend failure should mention backend."
+                        Assert-Contains -ExpectedSubstring "occupied" -Actual $message -Message "Occupied backend failure should mention the occupied port."
+                    }
+
+                    $probe = New-Object System.Net.Sockets.TcpClient
+                    try {
+                        $connectTask = $probe.ConnectAsync([System.Net.IPAddress]::Loopback, $occupied.Port)
+                        [void]$connectTask.Wait(2000)
+                        Assert-True -Condition $probe.Connected -Message "Unrelated listener should survive start refusal."
+                    } finally {
+                        $probe.Dispose()
+                    }
+                } finally {
+                    if ($null -ne $occupied) {
+                        $occupied.Listener.Stop()
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: identity capture failure stops the launched handle before state write"
+            Body = {
+                $fixture = New-StartFixture
+                $launchState = [pscustomobject]@{ Child = $null; ProcessId = $null }
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                    $launcher = {
+                        param($LaunchSpec)
+                        $launchState.Child = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role backend -Secret "SENTINEL-START-IDENTITY-FAILURE" -SkipIdentityCapture
+                        $launchState.ProcessId = [int]$launchState.Child.Process.Id
+                        return [pscustomobject]@{
+                            Process = $launchState.Child.Process
+                            IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine
+                        }
+                    }.GetNewClosure()
+                    $identityProvider = { param($ProcessHandle, $IntendedCommandLine) throw "identity-capture-failed" }
+                    $ready = { param($ReadySpec) return $true }
+
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort (Get-TestTcpPort) -FrontendPort (Get-TestTcpPort) -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -ProcessIdentityProvider $identityProvider -BackendReadyWaiter $ready -FrontendReadyWaiter $ready | Out-Null
+                        throw "Expected identity capture failure."
+                    } catch {
+                        Assert-Contains -ExpectedSubstring "identity-capture-failed" -Actual $_.Exception.Message -Message "Identity failure should surface its cause."
+                    }
+
+                    Start-Sleep -Milliseconds 300
+                    Assert-False -Condition ([bool](Get-Process -Id $launchState.ProcessId -ErrorAction SilentlyContinue)) -Message "Identity failure must stop the process launched before state creation."
+                    Assert-False -Condition (Test-Path -LiteralPath (Get-StopFixtureStatePath -ProjectRoot $fixture -Role backend)) -Message "Identity failure must not leave a backend state record."
+                } finally {
+                    Stop-StopTestChildProcess -Child $launchState.Child
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: injected success writes backend and frontend records atomically and emits safe URLs and log paths"
+            Body = {
+                $fixture = New-StartFixture
+                $launchState = [pscustomobject]@{ Count = 0; BackendChild = $null; FrontendChild = $null; BackendStartHandle = $null; FrontendStartHandle = $null }
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+                    $startParameters = (Get-Command Invoke-StartMain).Parameters
+                    Assert-True -Condition $startParameters.ContainsKey("ProcessIdentityProvider") -Message "Invoke-StartMain should expose a private launched-process identity seam."
+
+                    $backendPort = Get-TestTcpPort
+                    $frontendPort = Get-TestTcpPort
+                    $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                    $launcher = {
+                        param($LaunchSpec)
+                        $launchState.Count++
+                        if ($launchState.Count -eq 1) {
+                            $launchState.BackendChild = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role backend -Secret "SENTINEL-START-SUCCESS-BACKEND" -SkipIdentityCapture
+                            $launchState.BackendStartHandle = New-StartTrackedProcessHandle -ProcessHandle $launchState.BackendChild.Process
+                            return [pscustomobject]@{
+                                Process = $launchState.BackendStartHandle
+                                IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine
+                                StdOutLogPath = [string]$LaunchSpec.StdOutLogPath
+                                StdErrLogPath = [string]$LaunchSpec.StdErrLogPath
+                            }
+                        }
+
+                        $launchState.FrontendChild = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role frontend -Secret "SENTINEL-START-SUCCESS-FRONTEND" -SkipIdentityCapture
+                        $launchState.FrontendStartHandle = New-StartTrackedProcessHandle -ProcessHandle $launchState.FrontendChild.Process
+                        return [pscustomobject]@{
+                            Process = $launchState.FrontendStartHandle
+                            IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine
+                            StdOutLogPath = [string]$LaunchSpec.StdOutLogPath
+                            StdErrLogPath = [string]$LaunchSpec.StdErrLogPath
+                        }
+                    }.GetNewClosure()
+                    $identityProvider = { param($ProcessHandle, $IntendedCommandLine) New-StartSyntheticIdentity -ProcessHandle $ProcessHandle -CommandLine $IntendedCommandLine }
+                    $postStartPortStatusProvider = {
+                        param($Port)
+                        if ($Port -eq $backendPort) {
+                            return [pscustomobject]@{ Occupied = $true; ProcessId = [int]$launchState.BackendChild.Process.Id }
+                        }
+                        return [pscustomobject]@{ Occupied = $true; ProcessId = [int]$launchState.FrontendChild.Process.Id }
+                    }.GetNewClosure()
+                    $ready = { param($ReadySpec) return $true }
+
+                    $result = Invoke-StartMain -ProjectRoot $fixture -BackendPort $backendPort -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -ProcessIdentityProvider $identityProvider -PostStartPortStatusProvider $postStartPortStatusProvider -BackendReadyWaiter $ready -FrontendReadyWaiter $ready
+                    Assert-Equal -Expected 2 -Actual $launchState.Count -Message "Injected success should launch both roles exactly once."
+                    Assert-Equal -Expected "http://127.0.0.1:$frontendPort" -Actual $result.FrontendUrl -Message "Frontend URL mismatch."
+                    Assert-Equal -Expected "http://127.0.0.1:$backendPort/docs" -Actual $result.BackendDocsUrl -Message "Backend docs URL mismatch."
+                    Assert-True -Condition ($result.Messages.Count -ge 4) -Message "Injected success should return safe summary messages."
+                    Assert-False -Condition (($result.Messages -join "`n").Contains("SENTINEL-START-SUCCESS")) -Message "Start success output leaked a secret."
+                    Assert-False -Condition (($result.Messages -join "`n").Contains("project-role-backend")) -Message "Start success output leaked the raw backend command line."
+                    foreach ($startHandle in @($launchState.BackendStartHandle, $launchState.FrontendStartHandle)) {
+                        Assert-True -Condition ([bool]$startHandle.Tracker.Disposed) -Message "Successful start should dispose its temporary process handles."
+                    }
+
+                    foreach ($role in @("backend", "frontend")) {
+                        $recordPath = Get-StopFixtureStatePath -ProjectRoot $fixture -Role $role
+                        Assert-True -Condition (Test-Path -LiteralPath $recordPath -PathType Leaf) -Message "Injected success should write the $role record."
+                        $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+                        Assert-Equal -Expected 1 -Actual ([int]$record.schemaVersion) -Message "$role schemaVersion mismatch."
+                        Assert-Equal -Expected $fixture -Actual ([string]$record.projectRoot) -Message "$role projectRoot mismatch."
+                        Assert-Equal -Expected $role -Actual ([string]$record.role) -Message "$role role mismatch."
+                        Assert-True -Condition ([int]$record.pid -gt 0) -Message "$role pid must be positive."
+                        Assert-True -Condition ([string]$record.startTimeUtc).EndsWith("Z", [System.StringComparison]::Ordinal) -Message "$role startTimeUtc must be UTC roundtrip."
+                        Assert-Contains -ExpectedSubstring $fixture -Actual ([string]$record.commandLine) -Message "$role commandLine should contain the project root."
+                        Assert-Contains -ExpectedSubstring "project-role-$role" -Actual ([string]$record.commandLine) -Message "$role commandLine should contain the role marker."
+                    }
+                } finally {
+                    Stop-StopTestChildProcess -Child $launchState.BackendChild
+                    Stop-StopTestChildProcess -Child $launchState.FrontendChild
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: readiness failure stops only the started handles, removes their records, and preserves logs"
+            Body = {
+                $cases = @(
+                    [pscustomobject]@{
+                        Name = "backend"
+                        BackendReady = $false
+                        FrontendReady = $true
+                        OwnershipMatches = $true
+                    },
+                    [pscustomobject]@{
+                        Name = "frontend"
+                        BackendReady = $true
+                        FrontendReady = $false
+                        OwnershipMatches = $true
+                    },
+                    [pscustomobject]@{
+                        Name = "ownership"
+                        BackendReady = $true
+                        FrontendReady = $true
+                        OwnershipMatches = $false
+                    }
+                )
+
+                foreach ($case in $cases) {
+                    $fixture = New-StartFixture
+                    $launchState = [pscustomobject]@{ Count = 0; BackendChild = $null; FrontendChild = $null; BackendPid = $null; FrontendPid = $null }
+                    try {
+                        . (Get-StartScriptPath)
+                        Initialize-StartEnvironment
+
+                        $backendPort = Get-TestTcpPort
+                        $frontendPort = Get-TestTcpPort
+                        $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                        $launcher = {
+                            param($LaunchSpec)
+                            $launchState.Count++
+                            if ($launchState.Count -eq 1) {
+                                $launchState.BackendChild = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role backend -Secret "SENTINEL-START-READY-BACKEND" -SkipIdentityCapture
+                                $launchState.BackendPid = [int]$launchState.BackendChild.Process.Id
+                                Set-Content -LiteralPath $LaunchSpec.StdOutLogPath -Value "backend-log" -Encoding ASCII
+                                Set-Content -LiteralPath $LaunchSpec.StdErrLogPath -Value "" -Encoding ASCII
+                                return [pscustomobject]@{
+                                    Process = $launchState.BackendChild.Process
+                                    IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine
+                                    StdOutLogPath = [string]$LaunchSpec.StdOutLogPath
+                                    StdErrLogPath = [string]$LaunchSpec.StdErrLogPath
+                                }
+                            }
+
+                            $launchState.FrontendChild = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role frontend -Secret "SENTINEL-START-READY-FRONTEND" -SkipIdentityCapture
+                            $launchState.FrontendPid = [int]$launchState.FrontendChild.Process.Id
+                            Set-Content -LiteralPath $LaunchSpec.StdOutLogPath -Value "frontend-log" -Encoding ASCII
+                            Set-Content -LiteralPath $LaunchSpec.StdErrLogPath -Value "" -Encoding ASCII
+                            return [pscustomobject]@{
+                                Process = $launchState.FrontendChild.Process
+                                IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine
+                                StdOutLogPath = [string]$LaunchSpec.StdOutLogPath
+                                StdErrLogPath = [string]$LaunchSpec.StdErrLogPath
+                            }
+                        }.GetNewClosure()
+                        $identityProvider = { param($ProcessHandle, $IntendedCommandLine) New-StartSyntheticIdentity -ProcessHandle $ProcessHandle -CommandLine $IntendedCommandLine }
+                        $postStartPortStatusProvider = {
+                            param($Port)
+                            if (-not $case.OwnershipMatches) {
+                                return [pscustomobject]@{ Occupied = $true; ProcessId = 1 }
+                            }
+                            if ($Port -eq $backendPort) {
+                                return [pscustomobject]@{ Occupied = $true; ProcessId = [int]$launchState.BackendPid }
+                            }
+                            return [pscustomobject]@{ Occupied = $true; ProcessId = [int]$launchState.FrontendPid }
+                        }.GetNewClosure()
+                        $backendReadyWaiter = { param($ReadySpec) return $case.BackendReady }.GetNewClosure()
+                        $frontendReadyWaiter = { param($ReadySpec) return $case.FrontendReady }.GetNewClosure()
+
+                        $readinessError = $null
+                        try {
+                            Invoke-StartMain -ProjectRoot $fixture -BackendPort $backendPort -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -ProcessIdentityProvider $identityProvider -PostStartPortStatusProvider $postStartPortStatusProvider -BackendReadyWaiter $backendReadyWaiter -FrontendReadyWaiter $frontendReadyWaiter | Out-Null
+                        } catch {
+                            $readinessError = $_
+                        }
+                        Assert-True -Condition ($null -ne $readinessError) -Message "Expected readiness failure for $($case.Name)."
+                        Assert-Contains -ExpectedSubstring $case.Name -Actual $readinessError.Exception.Message.ToLowerInvariant() -Message "Readiness failure should mention the failing role."
+
+                        foreach ($role in @("backend", "frontend")) {
+                            $recordPath = Get-StopFixtureStatePath -ProjectRoot $fixture -Role $role
+                            Assert-False -Condition (Test-Path -LiteralPath $recordPath) -Message "Readiness failure should remove the $role record."
+                        }
+
+                        foreach ($processId in @($launchState.BackendPid, $launchState.FrontendPid)) {
+                            if ($null -ne $processId) {
+                                Start-Sleep -Milliseconds 300
+                                Assert-False -Condition ([bool](Get-Process -Id $processId -ErrorAction SilentlyContinue)) -Message "Readiness failure should stop every started child handle."
+                            }
+                        }
+
+                        foreach ($leaf in @("backend.stdout.log", "backend.stderr.log", "frontend.stdout.log", "frontend.stderr.log")) {
+                            Assert-True -Condition (Test-Path -LiteralPath (Join-Path $fixture ".runtime\logs\$leaf") -PathType Leaf) -Message "Readiness failure should preserve log file '$leaf'."
+                        }
+                    } finally {
+                        Stop-StopTestChildProcess -Child $launchState.BackendChild
+                        Stop-StopTestChildProcess -Child $launchState.FrontendChild
+                        Remove-TempFixture -Path $fixture
+                    }
+                }
+            }
+        },
+        @{
+            Name = "START: rollback preserves records and surfaces process stop failures"
+            Body = {
+                $fixture = New-StartFixture
+                $launchState = [pscustomobject]@{ Count = 0; BackendChild = $null; FrontendChild = $null }
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                    $launcher = {
+                        param($LaunchSpec)
+                        $launchState.Count++
+                        if ($launchState.Count -eq 1) {
+                            $launchState.BackendChild = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role backend -Secret "SENTINEL-START-STOP-FAILURE-BACKEND" -SkipIdentityCapture
+                            return [pscustomobject]@{ Process = $launchState.BackendChild.Process; IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine }
+                        }
+                        $launchState.FrontendChild = Start-StopTestChildProcess -ProjectRoot $LaunchSpec.ProjectRoot -Role frontend -Secret "SENTINEL-START-STOP-FAILURE-FRONTEND" -SkipIdentityCapture
+                        return [pscustomobject]@{ Process = $launchState.FrontendChild.Process; IntendedCommandLine = [string]$LaunchSpec.IntendedCommandLine }
+                    }.GetNewClosure()
+                    $identityProvider = { param($ProcessHandle, $IntendedCommandLine) New-StartSyntheticIdentity -ProcessHandle $ProcessHandle -CommandLine $IntendedCommandLine }
+                    $processStopper = { param($Started, $StopTimeoutSeconds) throw "injected-stop-failure" }
+                    $backendReadyWaiter = { param($ReadySpec) return $false }
+                    $frontendReadyWaiter = { param($ReadySpec) return $true }
+
+                    $startError = $null
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort (Get-TestTcpPort) -FrontendPort (Get-TestTcpPort) -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -ProcessIdentityProvider $identityProvider -ProcessStopper $processStopper -BackendReadyWaiter $backendReadyWaiter -FrontendReadyWaiter $frontendReadyWaiter | Out-Null
+                    } catch {
+                        $startError = $_
+                    }
+
+                    Assert-True -Condition ($null -ne $startError) -Message "Injected process-stop failure should fail start."
+                    Assert-Contains -ExpectedSubstring "cleanup" -Actual $startError.Exception.Message.ToLowerInvariant() -Message "Start should report rollback cleanup failure."
+                    Assert-Contains -ExpectedSubstring "injected-stop-failure" -Actual $startError.Exception.Message -Message "Start should preserve the process-stop failure cause."
+                    foreach ($role in @("backend", "frontend")) {
+                        Assert-True -Condition (Test-Path -LiteralPath (Get-StopFixtureStatePath -ProjectRoot $fixture -Role $role) -PathType Leaf) -Message "Failed process cleanup must preserve the $role state record."
+                    }
+                    Assert-True -Condition ([bool](Get-Process -Id $launchState.BackendChild.Process.Id -ErrorAction SilentlyContinue)) -Message "Injected backend stop failure should leave the child alive and recorded."
+                    Assert-True -Condition ([bool](Get-Process -Id $launchState.FrontendChild.Process.Id -ErrorAction SilentlyContinue)) -Message "Injected frontend stop failure should leave the child alive and recorded."
+                } finally {
+                    Stop-StopTestChildProcess -Child $launchState.BackendChild
+                    Stop-StopTestChildProcess -Child $launchState.FrontendChild
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: matching recorded healthy processes return idempotent without launching"
+            Body = {
+                $fixture = New-StartFixture
+                $backendChild = $null
+                $frontendChild = $null
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $backendChild = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-START-IDEMPOTENT-BACKEND" -SkipIdentityCapture
+                    $frontendChild = Start-StopTestChildProcess -ProjectRoot $fixture -Role frontend -Secret "SENTINEL-START-IDEMPOTENT-FRONTEND" -SkipIdentityCapture
+                    $backendIdentity = New-StartSyntheticIdentity -ProcessHandle $backendChild.Process -CommandLine $backendChild.IntendedCommandLine
+                    $frontendIdentity = New-StartSyntheticIdentity -ProcessHandle $frontendChild.Process -CommandLine $frontendChild.IntendedCommandLine
+                    $backendRecord = New-StopRecordFromSyntheticIdentity -Child $backendChild -ActualIdentity $backendIdentity
+                    $frontendRecord = New-StopRecordFromSyntheticIdentity -Child $frontendChild -ActualIdentity $frontendIdentity
+                    [void](Write-StopProcessRecord -ProjectRoot $fixture -Role backend -Record $backendRecord)
+                    [void](Write-StopProcessRecord -ProjectRoot $fixture -Role frontend -Record $frontendRecord)
+
+                    $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                    $launcher = {
+                        param($LaunchSpec)
+                        throw "launcher-should-not-run"
+                    }
+                    $backendPort = Get-TestTcpPort
+                    $frontendPort = Get-TestTcpPort
+                    $portProvider = {
+                        param($Port)
+                        switch ($Port) {
+                            $backendPort { return [pscustomobject]@{ Occupied = $true; ProcessId = $backendChild.Process.Id } }
+                            $frontendPort { return [pscustomobject]@{ Occupied = $true; ProcessId = $frontendChild.Process.Id } }
+                            default { return [pscustomobject]@{ Occupied = $false; ProcessId = $null } }
+                        }
+                    }.GetNewClosure()
+                    $identities = @{
+                        ([int]$backendChild.Process.Id) = $backendIdentity
+                        ([int]$frontendChild.Process.Id) = $frontendIdentity
+                    }
+                    $existingIdentityProvider = { param($ProcessHandle) $identities[[int]$ProcessHandle.Id] }.GetNewClosure()
+                    $ready = { param($ReadySpec) return $true }
+
+                    $freePortProvider = { param($Port) [pscustomobject]@{ Occupied = $false; ProcessId = $null } }
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort $backendPort -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -PortStatusProvider $freePortProvider -ExistingIdentityProvider $existingIdentityProvider -BackendReadyWaiter $ready -FrontendReadyWaiter $ready | Out-Null
+                        throw "Expected live recorded process refusal on free ports."
+                    } catch {
+                        Assert-Contains -ExpectedSubstring "recorded" -Actual $_.Exception.Message.ToLowerInvariant() -Message "Live recorded processes must not be overwritten when ports appear free."
+                    }
+
+                    $unknownOwnerPortProvider = {
+                        param($Port)
+                        return [pscustomobject]@{ Occupied = $true; ProcessId = $null }
+                    }
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort $backendPort -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -PortStatusProvider $unknownOwnerPortProvider -ExistingIdentityProvider $existingIdentityProvider -BackendReadyWaiter $ready -FrontendReadyWaiter $ready | Out-Null
+                        throw "Expected unknown port owner refusal."
+                    } catch {
+                        Assert-Contains -ExpectedSubstring "occupied" -Actual $_.Exception.Message.ToLowerInvariant() -Message "Unknown listener ownership must fail closed."
+                    }
+
+                    $mismatchedBackendIdentity = [pscustomobject]@{
+                        Pid = $backendIdentity.Pid
+                        ExecutablePath = $backendIdentity.ExecutablePath
+                        StartTimeUtc = $backendIdentity.StartTimeUtc
+                        CommandLine = $backendIdentity.CommandLine + " mismatched"
+                    }
+                    $mismatchedIdentities = @{
+                        ([int]$backendChild.Process.Id) = $mismatchedBackendIdentity
+                        ([int]$frontendChild.Process.Id) = $frontendIdentity
+                    }
+                    $mismatchedIdentityProvider = { param($ProcessHandle) $mismatchedIdentities[[int]$ProcessHandle.Id] }.GetNewClosure()
+                    try {
+                        Invoke-StartMain -ProjectRoot $fixture -BackendPort $backendPort -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -PortStatusProvider $portProvider -ExistingIdentityProvider $mismatchedIdentityProvider -BackendReadyWaiter $ready -FrontendReadyWaiter $ready | Out-Null
+                        throw "Expected mismatched command-line refusal."
+                    } catch {
+                        Assert-Contains -ExpectedSubstring "occupied" -Actual $_.Exception.Message.ToLowerInvariant() -Message "Mismatched actual command line must fail closed."
+                    }
+
+                    $result = Invoke-StartMain -ProjectRoot $fixture -BackendPort $backendPort -FrontendPort $frontendPort -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher -PortStatusProvider $portProvider -ExistingIdentityProvider $existingIdentityProvider -BackendReadyWaiter $ready -FrontendReadyWaiter $ready
+                    Assert-Equal -Expected "http://127.0.0.1:$frontendPort" -Actual $result.FrontendUrl -Message "Idempotent frontend URL mismatch."
+                    Assert-Equal -Expected "http://127.0.0.1:$backendPort/docs" -Actual $result.BackendDocsUrl -Message "Idempotent backend docs URL mismatch."
+                    Assert-Contains -ExpectedSubstring "already running" -Actual (($result.Messages -join "`n").ToLowerInvariant()) -Message "Idempotent start should report already-running services."
+                    Assert-True -Condition ([bool](Get-Process -Id $backendChild.Process.Id -ErrorAction SilentlyContinue)) -Message "Idempotent backend child should remain running."
+                    Assert-True -Condition ([bool](Get-Process -Id $frontendChild.Process.Id -ErrorAction SilentlyContinue)) -Message "Idempotent frontend child should remain running."
+                } finally {
+                    Stop-StopTestChildProcess -Child $backendChild
+                    Stop-StopTestChildProcess -Child $frontendChild
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: malformed or reparse state refuses before launch"
+            Body = {
+                $cases = @(
+                    [pscustomobject]@{
+                        Name = "malformed"
+                        Setup = {
+                            param($FixtureRoot)
+                            New-Item -ItemType Directory -Path (Join-Path $FixtureRoot ".runtime\state") -Force | Out-Null
+                            Set-Content -LiteralPath (Join-Path $FixtureRoot ".runtime\state\backend.json") -Value "{not-json" -Encoding ASCII
+                        }
+                        Expected = "invalid"
+                    },
+                    [pscustomobject]@{
+                        Name = "reparse"
+                        Setup = {
+                            param($FixtureRoot)
+                            $external = New-TempFixture
+                            New-Item -ItemType Directory -Path (Join-Path $FixtureRoot ".runtime") -Force | Out-Null
+                            New-Item -ItemType Directory -Path $external -Force | Out-Null
+                            New-Item -ItemType Junction -Path (Join-Path $FixtureRoot ".runtime\state") -Target $external | Out-Null
+                            return $external
+                        }
+                        Expected = "reparse point"
+                    },
+                    [pscustomobject]@{
+                        Name = "log-reparse"
+                        Setup = {
+                            param($FixtureRoot)
+                            $external = New-TempFixture
+                            $logsRoot = Join-Path $FixtureRoot ".runtime\logs"
+                            New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+                            New-Item -ItemType Directory -Path $external -Force | Out-Null
+                            New-Item -ItemType Junction -Path (Join-Path $logsRoot "backend.stdout.log") -Target $external | Out-Null
+                            return $external
+                        }
+                        Expected = "reparse point"
+                    }
+                )
+
+                foreach ($case in $cases) {
+                    $fixture = New-StartFixture
+                    $external = $null
+                    try {
+                        . (Get-StartScriptPath)
+                        Initialize-StartEnvironment
+                        $external = & $case.Setup $fixture
+
+                        $doctorRunner = { param($RootPath, $DoctorTimeoutSeconds) [pscustomobject]@{ ExitCode = 0; StdOut = "[PASS] doctor"; StdErr = "" } }
+                        $launcher = { param($LaunchSpec) throw "launcher-should-not-run" }
+
+                        try {
+                            Invoke-StartMain -ProjectRoot $fixture -BackendPort (Get-TestTcpPort) -FrontendPort (Get-TestTcpPort) -TimeoutSeconds 5 -DoctorRunner $doctorRunner -ProcessLauncher $launcher | Out-Null
+                            throw "Expected $($case.Name) refusal."
+                        } catch {
+                            Assert-Contains -ExpectedSubstring $case.Expected -Actual $_.Exception.Message.ToLowerInvariant() -Message "Start refusal mismatch for the $($case.Name) state case."
+                        }
+                    } finally {
+                        if ($external) {
+                            Remove-TempFixture -Path $external
+                        }
+                        Remove-TempFixture -Path $fixture
+                    }
+                }
+            }
+        },
+        @{
+            Name = "START: state writer rename failure preserves no partial final record"
+            Body = {
+                $fixture = New-StartFixture
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+
+                    $record = [ordered]@{
+                        schemaVersion = 1
+                        pid = 424242
+                        executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                        startTimeUtc = [datetime]::UtcNow.ToString("o")
+                        commandLine = "powershell.exe -NoProfile # project-role-backend $fixture"
+                        projectRoot = $fixture
+                        role = "backend"
+                    }
+                    $stateDirectory = Join-Path $fixture ".runtime\state"
+                    New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+                    $statePath = Join-Path $stateDirectory "backend.json"
+
+                    try {
+                        Write-StartStateRecord -RootPath $fixture -Role backend -Record $record -MoveAction { param($LiteralPath, $Destination) throw "rename-failed" }
+                        throw "Expected rename failure."
+                    } catch {
+                        Assert-Contains -ExpectedSubstring "rename-failed" -Actual $_.Exception.Message -Message "Rename failure should surface the move failure."
+                    }
+
+                    Assert-False -Condition (Test-Path -LiteralPath $statePath -PathType Leaf) -Message "Rename failure should leave no final record."
+                    Assert-Equal -Expected 0 -Actual @((Get-ChildItem -LiteralPath $stateDirectory -Force -ErrorAction SilentlyContinue)).Count -Message "Rename failure should leave no temp state leaf behind."
+
+                    $existingRecord = [ordered]@{
+                        schemaVersion = 1
+                        pid = 515151
+                        executablePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                        startTimeUtc = [datetime]::UtcNow.ToString("o")
+                        commandLine = "existing project-role-backend $fixture"
+                        projectRoot = $fixture
+                        role = "backend"
+                    }
+                    $existingJson = $existingRecord | ConvertTo-Json -Depth 4 -Compress
+                    [System.IO.File]::WriteAllText($statePath, $existingJson, [System.Text.Encoding]::UTF8)
+                    $collisionError = $null
+                    try {
+                        Write-StartStateRecord -RootPath $fixture -Role backend -Record $record | Out-Null
+                    } catch {
+                        $collisionError = $_
+                    }
+                    Assert-True -Condition ($null -ne $collisionError) -Message "Atomic state creation must refuse an existing final record."
+                    Assert-Equal -Expected $existingJson -Actual (Get-Content -LiteralPath $statePath -Raw -Encoding UTF8) -Message "State collision must preserve the existing record."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "START: generated records integrate with stop state reading and injected stop handle flow"
+            Body = {
+                $fixture = New-StartFixture
+                $child = $null
+                try {
+                    . (Get-StartScriptPath)
+                    Initialize-StartEnvironment
+                    $child = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-START-STOP-INTEGRATION" -SkipIdentityCapture
+                    $actualCommandLine = ([string]$child.IntendedCommandLine) + " 测试路径"
+                    $identity = New-StartSyntheticIdentity -ProcessHandle $child.Process -CommandLine $actualCommandLine
+                    $identityProvider = { param($ProcessHandle, $IntendedCommandLine) $identity }.GetNewClosure()
+                    $record = New-StartStateRecord -RootPath $fixture -Role backend -ProcessHandle $child.Process -IntendedCommandLine "constructed-command-must-not-be-stored" -IdentityProvider $identityProvider
+                    Assert-Equal -Expected $actualCommandLine -Actual ([string]$record.commandLine) -Message "Start record should store the captured actual command line."
+
+                    $statePath = Write-StartStateRecord -RootPath $fixture -Role backend -Record $record
+                    $readRecord = Read-StopStateRecord -StatePath $statePath -Role backend -ProjectRoot $fixture
+                    Assert-Equal -Expected ([int]$identity.Pid) -Actual ([int]$readRecord.pid) -Message "Stop reader should accept the start record pid."
+                    Assert-Equal -Expected $actualCommandLine -Actual ([string]$readRecord.commandLine) -Message "Stop reader should preserve the actual command line."
+
+                    $actualIdentity = [pscustomobject]@{
+                        Pid = [int]$identity.Pid
+                        ExecutablePath = [string]$identity.ExecutablePath
+                        StartTimeUtc = ([datetime]$identity.StartTimeUtc).ToUniversalTime()
+                        CommandLine = $actualCommandLine
+                    }
+                    $identityProvider = { param($ProcessHandle) $actualIdentity }.GetNewClosure()
+                    $identityComparer = {
+                        param($RecordedIdentity, $ProcessHandle, $ActualIdentity)
+                        if ([int]$RecordedIdentity.Pid -ne [int]$ActualIdentity.Pid) { return $false }
+                        if (-not ([System.IO.Path]::GetFullPath([string]$RecordedIdentity.ExecutablePath)).Equals([System.IO.Path]::GetFullPath([string]$ActualIdentity.ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+                        $recordedStart = [datetime]::Parse([string]$RecordedIdentity.StartTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+                        if ($recordedStart -ne ([datetime]$ActualIdentity.StartTimeUtc).ToUniversalTime()) { return $false }
+                        return ([string]$RecordedIdentity.CommandLine).Equals([string]$ActualIdentity.CommandLine, [System.StringComparison]::Ordinal)
+                    }.GetNewClosure()
+
+                    $stopResult = Stop-ManagedRole -RootPath $fixture -Role backend -TimeoutSeconds 5 -IdentityProvider $identityProvider -IdentityComparer $identityComparer
+                    Assert-True -Condition ([bool]$stopResult.Success) -Message "Stop handle flow should accept a start-written record when actual command line is supplied."
+                    Assert-False -Condition (Test-Path -LiteralPath $statePath) -Message "Successful stop should remove the start-written record."
+                } finally {
+                    Stop-StopTestChildProcess -Child $child
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "SkipRuntimeDownload fails when compatible runtimes are unavailable locally and on PATH"
             Body = {
                 $fixture = New-BootstrapFixture
@@ -2932,18 +3863,32 @@ $($case.Script)
 }
 
 function Invoke-BootstrapScriptTests {
-    $tests = Get-BootstrapScriptTests
+    param(
+        [string]$NamePattern = "*",
+        [switch]$ShowProgress
+    )
+
+    $tests = @(Get-BootstrapScriptTests | Where-Object { $_.Name -like $NamePattern })
     $results = @()
 
     foreach ($test in $tests) {
         try {
+            if ($ShowProgress) {
+                Write-Host "RUN $($test.Name)"
+            }
             & $test.Body
+            if ($ShowProgress) {
+                Write-Host "PASS $($test.Name)"
+            }
             $results += [pscustomobject]@{
                 Name = $test.Name
                 Passed = $true
                 Error = $null
             }
         } catch {
+            if ($ShowProgress) {
+                Write-Host "FAIL $($test.Name)"
+            }
             $results += [pscustomobject]@{
                 Name = $test.Name
                 Passed = $false
