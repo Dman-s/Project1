@@ -268,8 +268,9 @@ Expected: imageio_ffmpeg.get_ffmpeg_exe() returns an existing bundled executable
 - [ ] **Step 2: Write failing encoder contract tests**
 
 Use a fake writer generator to prove startup, BGR-to-RGB conversion, odd-dimension
-padding without scaling, shape validation, audio input, close validation, and abort
-cleanup:
+padding without scaling, shape validation, conditional audio input, close validation,
+and abort cleanup. Add an audio probe test proving that a source without an audio
+stream does not pass audio_path to imageio-ffmpeg.
 
 ~~~python
 def test_encoder_streams_rgb_frames_and_returns_non_empty_output(tmp_path):
@@ -324,6 +325,7 @@ class BrowserVideoEncoder:
         height: int,
         fps: float,
         writer_factory=imageio_ffmpeg.write_frames,
+        audio_probe=source_has_audio,
     ):
         self.output_path = output_path
         self.source_path = source_path
@@ -333,23 +335,32 @@ class BrowserVideoEncoder:
         self.output_height = height + height % 2
         self.fps = fps
         self.writer_factory = writer_factory
+        self.audio_probe = audio_probe
         self._writer = None
 
     def open(self) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        options = {
+            "fps": self.fps,
+            "codec": "libx264",
+            "pix_fmt_in": "rgb24",
+            "pix_fmt_out": "yuv420p",
+            "quality": 7,
+            "macro_block_size": 2,
+            "ffmpeg_log_level": "error",
+            "output_params": [
+                "-movflags", "+faststart", "-preset", "veryfast"
+            ],
+        }
+        if self.audio_probe(self.source_path):
+            options.update(
+                audio_path=str(self.source_path),
+                audio_codec="aac",
+            )
         self._writer = self.writer_factory(
             str(self.output_path),
             (self.output_width, self.output_height),
-            fps=self.fps,
-            codec="libx264",
-            pix_fmt_in="rgb24",
-            pix_fmt_out="yuv420p",
-            quality=7,
-            macro_block_size=2,
-            ffmpeg_log_level="error",
-            output_params=["-movflags", "+faststart", "-preset", "veryfast"],
-            audio_path=str(self.source_path),
-            audio_codec="aac",
+            **options,
         )
         self._writer.send(None)
 
@@ -384,23 +395,27 @@ class BrowserVideoEncoder:
         self.output_path.unlink(missing_ok=True)
 ~~~
 
-Create the writer with:
+Detect audio with a bounded FFmpeg probe:
 
 ~~~python
-self._writer = self.writer_factory(
-    str(self.output_path),
-    (self.width, self.height),
-    fps=self.fps,
-    codec="libx264",
-    pix_fmt_in="rgb24",
-    pix_fmt_out="yuv420p",
-    quality=7,
-    macro_block_size=2,
-    ffmpeg_log_level="error",
-    output_params=["-movflags", "+faststart", "-preset", "veryfast"],
-    audio_path=str(self.source_path),
-    audio_codec="aac",
-)
+def source_has_audio(source_path: Path, *, ffmpeg_exe: str | None = None) -> bool:
+    executable = ffmpeg_exe or imageio_ffmpeg.get_ffmpeg_exe()
+    completed = subprocess.run(
+        [
+            executable,
+            "-v", "error",
+            "-i", str(source_path),
+            "-map", "0:a:0",
+            "-t", "0.1",
+            "-f", "null",
+            "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    return completed.returncode == 0
 ~~~
 
 Convert BGR with cv2.cvtColor, send a contiguous array, and translate writer failures into VideoEncodingError. close must require a non-empty output. abort must close the generator and remove partial output.
