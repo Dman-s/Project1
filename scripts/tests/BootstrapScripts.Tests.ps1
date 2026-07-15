@@ -1287,6 +1287,108 @@ try {
             }
         },
         @{
+            Name = "Atomic Python replacement keeps the valid runtime when old backup cleanup fails"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $runtimeRoot = Join-Path $fixture ".runtime"
+                    $pythonRoot = Join-Path $runtimeRoot "python"
+                    $downloadsRoot = Join-Path $runtimeRoot "downloads"
+                    New-Item -ItemType Directory -Path $pythonRoot -Force | Out-Null
+                    New-Item -ItemType Directory -Path $downloadsRoot -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $pythonRoot "python.exe") -Value "3.10.10" -Encoding ASCII
+                    Set-Content -LiteralPath (Join-Path $pythonRoot "original.txt") -Value "old-python" -Encoding ASCII
+                    $installerPath = Join-Path $downloadsRoot "python-installer.exe"
+                    Set-Content -LiteralPath $installerPath -Value "fake-installer" -Encoding ASCII
+
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $escapedInstaller = $installerPath.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+`$WarningPreference = 'SilentlyContinue'
+. '$scriptPath'
+`$paths = [pscustomobject]@{
+    Root = '$escapedFixture'
+    RuntimeRoot = '$escapedFixture\.runtime'
+    DownloadsRoot = '$escapedFixture\.runtime\downloads'
+    PythonRoot = '$escapedFixture\.runtime\python'
+}
+function Remove-IfExists {
+    param([string]`$Path, [string]`$RootPath)
+    if ([System.IO.Path]::GetFileName(`$Path) -like 'python-backup-*') {
+        throw 'SENTINEL-PYTHON-BACKUP-CLEANUP-FAILED'
+    }
+    if (Test-Path -LiteralPath `$Path) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath `$Path -Force -Recurse
+    }
+}
+`$installedPath = Install-PythonRuntimeAtomically -Paths `$paths -InstallerPath '$escapedInstaller' -ExpectedVersion '3.10.11' -InstallerInvoker {
+    param(`$InstallerPath, `$TargetDir)
+    New-Item -ItemType Directory -Path `$TargetDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path `$TargetDir 'python.exe') -Value '3.10.11' -Encoding ASCII
+} -PythonVersionResolver {
+    param(`$PythonPath)
+    [System.IO.File]::ReadAllText(`$PythonPath).Trim()
+}
+`$backup = Get-ChildItem -LiteralPath `$paths.RuntimeRoot -Directory -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like 'python-backup-*' } | Select-Object -First 1
+[ordered]@{
+    InstalledPath = `$installedPath
+    InstalledContent = [System.IO.File]::ReadAllText((Join-Path `$paths.PythonRoot 'python.exe')).Trim()
+    OriginalRestored = Test-Path -LiteralPath (Join-Path `$paths.PythonRoot 'original.txt')
+    BackupCount = @((Get-ChildItem -LiteralPath `$paths.RuntimeRoot -Directory -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like 'python-backup-*' })).Count
+    BackupPreserved = `$null -ne `$backup -and (Test-Path -LiteralPath (Join-Path `$backup.FullName 'original.txt'))
+} | ConvertTo-Json -Compress
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected (Join-Path $pythonRoot "python.exe") -Actual $state.InstalledPath -Message "Python cleanup failure should still return the valid runtime path."
+                    Assert-Equal -Expected "3.10.11" -Actual $state.InstalledContent -Message "Python cleanup failure should keep the valid new runtime."
+                    Assert-False -Condition $state.OriginalRestored -Message "Python cleanup failure must not restore the old runtime over a valid install."
+                    Assert-Equal -Expected 1 -Actual $state.BackupCount -Message "Python cleanup failure should preserve one old-runtime backup."
+                    Assert-True -Condition $state.BackupPreserved -Message "Python cleanup failure should preserve the old runtime contents."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "PATH runtime probes return the first command when multiple applications match"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+function Get-Command {
+    param([string]`$Name)
+    switch (`$Name) {
+        'python.exe' { @([pscustomobject]@{ Source = 'C:\first\python.exe' }, [pscustomobject]@{ Source = 'C:\second\python.exe' }) }
+        'node.exe' { @([pscustomobject]@{ Source = 'C:\first\node.exe' }, [pscustomobject]@{ Source = 'C:\second\node.exe' }) }
+        'npm.cmd' { @([pscustomobject]@{ Source = 'C:\first\npm.cmd' }, [pscustomobject]@{ Source = 'C:\second\npm.cmd' }) }
+        default { `$null }
+    }
+}
+[ordered]@{
+    Python = Get-PythonCommandFromPath
+    Node = Get-NodeCommandFromPath
+    Npm = Get-NpmCommandFromPath
+} | ConvertTo-Json -Compress
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 'C:\first\python.exe' -Actual $state.Python -Message "Python PATH probe should return one command path."
+                    Assert-Equal -Expected 'C:\first\node.exe' -Actual $state.Node -Message "Node PATH probe should return one command path."
+                    Assert-Equal -Expected 'C:\first\npm.cmd' -Actual $state.Npm -Message "npm PATH probe should return one command path."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "SkipRuntimeDownload rejects node and npm resolved from different directories"
             Body = {
                 $fixture = New-BootstrapFixture
@@ -1465,6 +1567,123 @@ try {
                     Assert-Contains -ExpectedSubstring "GPU mode requires torch CUDA self-test to succeed" -Actual $state.Message -Message "Forced GPU failure should surface the CUDA self-test failure."
                     Assert-True -Condition $state.OriginalRestored -Message "Forced GPU failure should restore the original venv."
                     Assert-Equal -Expected 0 -Actual $state.BackupCount -Message "Forced GPU failure should clean the venv backup after restore."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Backend environment rollback preserves the backup when partial cleanup fails"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $backendRoot = Join-Path $fixture "backend"
+                    $venvRoot = Join-Path $backendRoot ".venv"
+                    New-Item -ItemType Directory -Path $venvRoot -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $venvRoot "original.txt") -Value "old-env" -Encoding ASCII
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+function Remove-IfExists {
+    param([string]`$Path, [string]`$RootPath)
+    if (`$Path -eq `$paths.VenvRoot) {
+        throw 'SENTINEL-CLEANUP-FAILED'
+    }
+    if (Test-Path -LiteralPath `$Path) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath `$Path -Force -Recurse
+    }
+}
+try {
+    Install-BackendPythonEnvironment -Paths `$paths -PythonPath 'fake-python.exe' -RequestedDevice 'gpu' -InitialDevice 'gpu' -CpuRequirementsPath (Join-Path `$paths.BackendRoot 'requirements-cpu.txt') -GpuRequirementsPath (Join-Path `$paths.BackendRoot 'requirements-gpu.txt') -VenvCreator {
+        param(`$PythonPath, `$TargetPath)
+        New-Item -ItemType Directory -Path (Join-Path `$TargetPath 'Scripts') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path `$TargetPath 'Scripts\python.exe') -Value 'partial-venv' -Encoding ASCII
+    } -RequirementsInstaller {
+        param(`$PythonPath, `$RequirementsPath, `$WorkingDirectory)
+        throw 'SENTINEL-INSTALL-FAILED'
+    } -CudaSelfTester {
+        param(`$PythonPath)
+        `$true
+    } | Out-Null
+    throw 'Expected backend environment failure.'
+} catch {
+    `$backup = Get-ChildItem -LiteralPath `$paths.BackendRoot -Directory -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.venv-backup-*' } | Select-Object -First 1
+    [ordered]@{
+        Message = `$_.Exception.Message
+        PartialExists = Test-Path -LiteralPath (Join-Path `$paths.VenvRoot 'Scripts\python.exe')
+        BackupCount = @((Get-ChildItem -LiteralPath `$paths.BackendRoot -Directory -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.venv-backup-*' })).Count
+        BackupPreserved = `$null -ne `$backup -and (Test-Path -LiteralPath (Join-Path `$backup.FullName 'original.txt'))
+    } | ConvertTo-Json -Compress
+}
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Contains -ExpectedSubstring "SENTINEL-INSTALL-FAILED" -Actual $state.Message -Message "Rollback failure should retain the original installation error."
+                    Assert-Contains -ExpectedSubstring "SENTINEL-CLEANUP-FAILED" -Actual $state.Message -Message "Rollback failure should report the cleanup error."
+                    Assert-True -Condition $state.PartialExists -Message "Failed cleanup fixture should leave the partial environment in place."
+                    Assert-Equal -Expected 1 -Actual $state.BackupCount -Message "Failed cleanup must preserve exactly one prior-environment backup."
+                    Assert-True -Condition $state.BackupPreserved -Message "Failed cleanup must preserve the prior environment contents."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Backend environment keeps the valid venv when old backup cleanup fails"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $backendRoot = Join-Path $fixture "backend"
+                    $venvRoot = Join-Path $backendRoot ".venv"
+                    New-Item -ItemType Directory -Path $venvRoot -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path $venvRoot "original.txt") -Value "old-env" -Encoding ASCII
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+`$WarningPreference = 'SilentlyContinue'
+. '$scriptPath'
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+function Remove-IfExists {
+    param([string]`$Path, [string]`$RootPath)
+    if ([System.IO.Path]::GetFileName(`$Path) -like '.venv-backup-*') {
+        throw 'SENTINEL-VENV-BACKUP-CLEANUP-FAILED'
+    }
+    if (Test-Path -LiteralPath `$Path) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath `$Path -Force -Recurse
+    }
+}
+`$installed = Install-BackendPythonEnvironment -Paths `$paths -PythonPath 'fake-python.exe' -RequestedDevice 'cpu' -InitialDevice 'cpu' -CpuRequirementsPath (Join-Path `$paths.BackendRoot 'requirements-cpu.txt') -GpuRequirementsPath (Join-Path `$paths.BackendRoot 'requirements-gpu.txt') -VenvCreator {
+    param(`$PythonPath, `$TargetPath)
+    New-Item -ItemType Directory -Path (Join-Path `$TargetPath 'Scripts') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path `$TargetPath 'Scripts\python.exe') -Value 'valid-venv' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path `$TargetPath 'installed.txt') -Value 'new-env' -Encoding ASCII
+} -RequirementsInstaller {
+    param(`$PythonPath, `$RequirementsPath, `$WorkingDirectory)
+} -CudaSelfTester {
+    param(`$PythonPath)
+    `$true
+}
+`$backup = Get-ChildItem -LiteralPath `$paths.BackendRoot -Directory -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.venv-backup-*' } | Select-Object -First 1
+[ordered]@{
+    SelectedDevice = `$installed.SelectedDevice
+    NewEnvironmentExists = Test-Path -LiteralPath (Join-Path `$paths.VenvRoot 'installed.txt')
+    OriginalRestored = Test-Path -LiteralPath (Join-Path `$paths.VenvRoot 'original.txt')
+    BackupCount = @((Get-ChildItem -LiteralPath `$paths.BackendRoot -Directory -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.venv-backup-*' })).Count
+    BackupPreserved = `$null -ne `$backup -and (Test-Path -LiteralPath (Join-Path `$backup.FullName 'original.txt'))
+} | ConvertTo-Json -Compress
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected "cpu" -Actual $state.SelectedDevice -Message "Venv cleanup failure should still return the selected device."
+                    Assert-True -Condition $state.NewEnvironmentExists -Message "Venv cleanup failure should keep the valid new environment."
+                    Assert-False -Condition $state.OriginalRestored -Message "Venv cleanup failure must not restore the old environment over a valid install."
+                    Assert-Equal -Expected 1 -Actual $state.BackupCount -Message "Venv cleanup failure should preserve one old-environment backup."
+                    Assert-True -Condition $state.BackupPreserved -Message "Venv cleanup failure should preserve the old environment contents."
                 } finally {
                     Remove-TempFixture -Path $fixture
                 }

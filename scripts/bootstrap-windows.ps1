@@ -452,7 +452,12 @@ function Install-PythonRuntimeAtomically {
         }
 
         if ($backupCreated -and (Test-Path -LiteralPath $backupRoot -PathType Container)) {
-            Remove-IfExists -Path $backupRoot -RootPath $Paths.Root
+            try {
+                Remove-IfExists -Path $backupRoot -RootPath $Paths.Root
+            } catch {
+                Write-Warning "The new Python runtime is valid, but the previous runtime backup could not be removed from '$backupRoot': $($_.Exception.Message)"
+            }
+            $backupCreated = $false
         }
 
         return $finalPythonPath
@@ -584,9 +589,9 @@ function Get-PythonCommandFromPath {
         return $null
     }
 
-    $command = Get-Command "python.exe" -CommandType Application -ErrorAction SilentlyContinue
+    $command = Get-Command "python.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $command) {
-        $command = Get-Command "python" -CommandType Application -ErrorAction SilentlyContinue
+        $command = Get-Command "python" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     }
 
     if ($null -eq $command) {
@@ -603,9 +608,9 @@ function Get-NodeCommandFromPath {
         return $null
     }
 
-    $command = Get-Command "node.exe" -CommandType Application -ErrorAction SilentlyContinue
+    $command = Get-Command "node.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $command) {
-        $command = Get-Command "node" -CommandType Application -ErrorAction SilentlyContinue
+        $command = Get-Command "node" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     }
 
     if ($null -eq $command) {
@@ -622,7 +627,7 @@ function Get-NpmCommandFromPath {
         return $null
     }
 
-    $command = Get-Command "npm.cmd" -CommandType Application -ErrorAction SilentlyContinue
+    $command = Get-Command "npm.cmd" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $command) {
         return $null
     }
@@ -778,29 +783,62 @@ function Install-BackendPythonEnvironment {
             }
         }
 
-        if ($backupCreated -and (Test-Path -LiteralPath $backupRoot -PathType Container)) {
-            Remove-IfExists -Path $backupRoot -RootPath $Paths.Root
-        }
-
-        return [pscustomobject]@{
+        $result = [pscustomobject]@{
             VenvPythonPath = $venvPythonPath
             SelectedDevice = $selectedDevice
             RequirementsPath = $requirementsPath
         }
+
+        if ($backupCreated -and (Test-Path -LiteralPath $backupRoot -PathType Container)) {
+            try {
+                Remove-IfExists -Path $backupRoot -RootPath $Paths.Root
+            } catch {
+                Write-Warning "The new backend environment is valid, but the previous environment backup could not be removed from '$backupRoot': $($_.Exception.Message)"
+            }
+            $backupCreated = $false
+        }
+
+        return $result
     } catch {
+        $installationError = $_.Exception
+        $cleanupError = $null
+        $restoreError = $null
+
         if (Test-Path -LiteralPath $Paths.VenvRoot -PathType Container) {
-            Remove-IfExists -Path $Paths.VenvRoot -RootPath $Paths.Root
+            try {
+                Remove-IfExists -Path $Paths.VenvRoot -RootPath $Paths.Root
+            } catch {
+                $cleanupError = $_.Exception
+            }
         }
 
         if ($backupCreated -and (Test-Path -LiteralPath $backupRoot -PathType Container)) {
-            Move-Item -LiteralPath $backupRoot -Destination $Paths.VenvRoot
+            if (-not (Test-Path -LiteralPath $Paths.VenvRoot)) {
+                try {
+                    Move-Item -LiteralPath $backupRoot -Destination $Paths.VenvRoot
+                    $backupCreated = $false
+                } catch {
+                    $restoreError = $_.Exception
+                }
+            }
         }
 
-        throw
-    } finally {
-        if ($backupCreated -and (Test-Path -LiteralPath $backupRoot -PathType Container)) {
-            Remove-IfExists -Path $backupRoot -RootPath $Paths.Root
+        if ($null -ne $cleanupError -or $null -ne $restoreError) {
+            $details = New-Object System.Collections.Generic.List[string]
+            $details.Add("Backend environment installation failed: $($installationError.Message)")
+            if ($null -ne $cleanupError) {
+                $details.Add("Partial environment cleanup failed: $($cleanupError.Message)")
+            }
+            if ($null -ne $restoreError) {
+                $details.Add("Previous environment restore failed: $($restoreError.Message)")
+            }
+            if (Test-Path -LiteralPath $backupRoot -PathType Container) {
+                $details.Add("The previous environment is preserved at '$backupRoot'.")
+            }
+            throw ($details -join " ")
         }
+
+        throw $installationError
     }
 }
 
