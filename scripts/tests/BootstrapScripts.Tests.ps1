@@ -3229,7 +3229,7 @@ exit 0
                     . (Get-StartScriptPath)
                     Initialize-StartEnvironment
                     $child = Start-StopTestChildProcess -ProjectRoot $fixture -Role backend -Secret "SENTINEL-START-STOP-INTEGRATION" -SkipIdentityCapture
-                    $actualCommandLine = ([string]$child.IntendedCommandLine) + " 测试路径"
+                    $actualCommandLine = ([string]$child.IntendedCommandLine) + " test-path"
                     $identity = New-StartSyntheticIdentity -ProcessHandle $child.Process -CommandLine $actualCommandLine
                     $identityProvider = { param($ProcessHandle, $IntendedCommandLine) $identity }.GetNewClosure()
                     $record = New-StartStateRecord -RootPath $fixture -Role backend -ProcessHandle $child.Process -IntendedCommandLine "constructed-command-must-not-be-stored" -IdentityProvider $identityProvider

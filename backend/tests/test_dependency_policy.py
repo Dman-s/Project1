@@ -22,8 +22,17 @@ def test_security_sensitive_web_dependencies_are_exact_and_patched():
     assert "starlette==1.3.1" in requirements
     assert "python-multipart==0.0.32" in requirements
     assert "pydantic==2.9.2" in requirements
-    assert "langgraph==0.5.4" in requirements
-    assert not any(line.startswith("langgraph>=") for line in requirements)
+    assert "PyJWT[crypto]==2.13.0" in requirements
+    assert "opencv-python==4.9.0.80" in requirements
+    assert "Pillow==12.3.0" in requirements
+    assert "pytest==9.1.1" in requirements
+    assert "pytest-asyncio==1.4.0" in requirements
+    assert "python-dotenv==1.2.2" in requirements
+    assert not any(line.lower().startswith("python-jose") for line in requirements)
+    assert not any(
+        line.lower().startswith(("langchain", "langgraph", "langsmith", "openai", "ollama"))
+        for line in requirements
+    )
 
 
 def test_ci_runs_a_bounded_python_dependency_audit():
@@ -47,6 +56,7 @@ def test_common_transitive_dependencies_use_exact_constraints():
 
     assert "-c requirements-common.lock" in requirements
     assert lock_lines
+    assert 'uvloop==0.22.1; sys_platform != "win32"' in lock_lines
     assert all("==" in line and ">=" not in line and "~=" not in line for line in lock_lines)
     assert not any(line.lower().startswith(("torch==", "torchvision==")) for line in lock_lines)
 

@@ -13,7 +13,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from jose import JWTError
+from jwt.exceptions import InvalidTokenError as JWTError
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 

@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta
 
 import bcrypt
+import jwt
 from app.config.settings import settings
-from jose import jwt
 
 
 def hash_password(password: str) -> str:

@@ -207,6 +207,20 @@ function Get-ProjectEnvironmentTests {
             }
         },
         @{
+            Name = "Windows PowerShell test scripts remain ASCII-compatible"
+            Body = {
+                $nonAsciiFiles = @(
+                    Get-ChildItem -LiteralPath $PSScriptRoot -Filter "*.ps1" -File |
+                        Where-Object {
+                            @([System.IO.File]::ReadAllBytes($_.FullName) | Where-Object { $_ -gt 127 }).Count -gt 0
+                        } |
+                        Select-Object -ExpandProperty Name
+                )
+
+                Assert-Equal -Expected @() -Actual $nonAsciiFiles -Message "Windows PowerShell 5.1 test scripts must parse under non-UTF-8 system code pages."
+            }
+        },
+        @{
             Name = "Read-BootstrapManifest returns the expected runtime metadata"
             Body = {
                 $manifest = Read-BootstrapManifest -Path $ManifestPath
