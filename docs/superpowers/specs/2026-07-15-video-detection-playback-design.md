@@ -105,7 +105,7 @@ visible across many adjacent frames does not create hundreds of gallery entries.
 The backend uses a repository-pinned FFmpeg runtime supplied by a Python package rather
 than requiring a system FFmpeg installation, WSL, Docker, or Microsoft Store access.
 The encoder receives raw BGR frames and produces H.264 video with `yuv420p` pixel format
-and fast-start metadata. A final mux step copies or converts source audio when present.
+and fast-start metadata. The annotated output intentionally contains no audio track.
 The completed output is stored under the existing task-specific uploads directory and
 served through `/uploads`.
 
