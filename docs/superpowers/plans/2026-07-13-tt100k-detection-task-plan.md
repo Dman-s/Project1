@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.10, FastAPI, SQLAlchemy, SQLite/PostgreSQL-compatible ORM, Ultralytics YOLO, Pillow, OpenCV, React 18, Zustand, Vitest.
 
+**Portable path:** `$PROJECT_ROOT` denotes the repository root in all commands and examples.
+
 ---
 
 ## File Map
@@ -61,7 +63,7 @@ def test_local_yolo_settings_resolve_project_paths():
 Run:
 
 ```powershell
-cd D:\Project1-main1\backend
+Set-Location "$PROJECT_ROOT\backend"
 .\.venv\Scripts\python.exe -m pytest tests/test_local_mode.py::test_local_yolo_settings_resolve_project_paths -q
 ```
 
@@ -395,13 +397,13 @@ Link the model-inference section from the root README.
 Run:
 
 ```powershell
-cd D:\Project1-main1\backend
-$env:YOLO_CONFIG_DIR='D:\Project1-main1\.venv\cache\yolo'
-$env:MPLCONFIGDIR='D:\Project1-main1\.venv\cache\matplotlib'
+Set-Location "$PROJECT_ROOT\backend"
+$env:YOLO_CONFIG_DIR="$PROJECT_ROOT\.venv\cache\yolo"
+$env:MPLCONFIGDIR="$PROJECT_ROOT\.venv\cache\matplotlib"
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m pip check
 
-cd D:\Project1-main1\frontend
+Set-Location "$PROJECT_ROOT\frontend"
 npm run test:run
 npm run build
 ```

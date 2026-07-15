@@ -1,26 +1,30 @@
 # 模型 v1 发布契约
 
-本文档定义模型 v1 发布时应提供的资源、默认选择、来源说明、评估背景和完整性校验规则。它是发布契约，不表示相关版本或资源已经发布。只有文件名、字节数和 SHA-256 均与本契约一致的文件，才应被视为对应的发布资源。
+本文档记录模型 v1 候选工件、运行时选择、来源说明、评估背景和完整性校验规则，不表示相关版本或资源已经发布。文件名、字节数和 SHA-256 只用于识别工件，不能证明其许可或再分发资格。
+
+**发布状态：阻塞。** `tt100k-yolo11s-reference42.pt` 的再分发来源尚未完备，不得加入 GitHub Release。在该问题解决且默认下载清单同步调整前，不应创建声称完整可用的 `models-v1` Release。
 
 ## 资源清单
 
-| 文件 | 用途 | 默认状态 | 大小（字节） | SHA-256 | 许可 |
+| 文件 | 用途 | 本地运行状态 | 大小（字节） | SHA-256 | 发布状态与适用条款 |
 | --- | --- | --- | ---: | --- | --- |
-| `tt100k-yolo11s-reference42.pt` | TT100K 42 类参考检测器 | 默认检测器 | 19231379 | `E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88` | AGPL-3.0 |
-| `tt100k-yolo11n-common45.pt` | Project1 common45 检测器 | 可选检测器 | 5488602 | `A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13` | AGPL-3.0 |
-| `gtsrb-yolo11n-cls.pt` | GTSRB 分类器 | 默认分类器 | 3291010 | `323E5BD1B0DC5D1F6FBB4C487FAF2320DA0DF9C21132DD46C0C94FEE7B33B16C` | AGPL-3.0 |
+| `tt100k-yolo11s-reference42.pt` | TT100K 42 类参考检测器 | 默认检测器 | 19231379 | `E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88` | **禁止发布**：缺少可核验的训练来源和再分发授权 |
+| `tt100k-yolo11n-common45.pt` | Project1 common45 检测器 | 可选检测器 | 5488602 | `A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13` | 条件发布：TT100K CC BY-NC、署名/引用要求及 Ultralytics 许可义务 |
+| `gtsrb-yolo11n-cls.pt` | GTSRB 分类器 | 默认分类器 | 3291010 | `323E5BD1B0DC5D1F6FBB4C487FAF2320DA0DF9C21132DD46C0C94FEE7B33B16C` | 条件发布：先核验 GTSRB 训练来源和 Ultralytics 许可义务 |
 
 ## 用途与默认值
 
-- 默认 TT100K 检测器为 `tt100k-yolo11s-reference42.pt`。
+- 当前本地配置的默认 TT100K 检测器为 `tt100k-yolo11s-reference42.pt`；这不代表它可以发布。
 - `tt100k-yolo11n-common45.pt` 是可选的 Project1 common45 检测器，不替代默认检测器。
 - 默认 GTSRB 分类器为 `gtsrb-yolo11n-cls.pt`。
 
 ## 来源与评估背景
 
+TT100K 官方页面将数据集标为 [CC BY-NC](https://cg.cs.tsinghua.edu.cn/traffic-sign/)，要求署名且限于许可允许的非商业用途，并给出 CVPR 2016 论文 “Traffic-Sign Detection and Classification in the Wild” 作为引用。仓库 AGPL-3.0 和 Ultralytics AGPL/Enterprise 义务不能替代这些数据条款。完整引用和许可边界见 [第三方声明](../../THIRD_PARTY_NOTICES.md)。
+
 ### `tt100k-yolo11s-reference42.pt`
 
-该检查点来自用户提供的 42 类参考训练。其自有验证集（own-val）指标为：P `0.74464`、R `0.67341`、mAP50 `0.74842`、mAP50-95 `0.57963`。
+该检查点来自用户提供的 42 类参考训练。训练者、原始项目权利人、所用数据版本和允许再分发的证明尚未记录，因此不得发布。以下指标仅记录本地评估背景：P `0.74464`、R `0.67341`、mAP50 `0.74842`、mAP50-95 `0.57963`。
 
 记录的推理配置使用 SAHI，切片大小为 `512x512`，重叠比例为 `0.2`。输出映射到 common45 后缺少 `ph5`、`w32` 和 `wo`。样例 `97549.jpg` 的结果为 `pl40`，置信度 `89.32%`，耗时约 `343 ms`。
 
@@ -36,6 +40,8 @@
 
 ## 限制
 
+- `tt100k-yolo11s-reference42.pt` 在来源链、数据条款和权利人再分发授权形成可核验记录之前，不得上传到 GitHub Release 或以其他方式分发。
+- TT100K 派生权重不能仅以 AGPL-3.0 标注；其使用和发布还受 TT100K CC BY-NC、署名和引用要求约束。
 - `tt100k-yolo11s-reference42.pt` 的 own-val 指标与 corrected45 评估背景不可直接比较，不应据此得出两个检查点之间的优劣结论。
 - reference42 输出映射到 common45 时缺少 `ph5`、`w32` 和 `wo`，因此不提供完整的 common45 类别覆盖。
 - `tt100k-yolo11n-common45.pt` 没有在本契约中声明候选检查点指标；旧 corrected-val 基线仅用于背景说明。
@@ -44,7 +50,7 @@
 
 ## PowerShell 完整性校验
 
-在包含三个模型文件的目录中运行以下 PowerShell。脚本使用 `Get-Item` 校验精确字节数，并使用 `Get-FileHash -Algorithm SHA256` 校验哈希；任一项不匹配都会终止并报错。
+在包含本地候选模型的目录中运行以下 PowerShell。脚本使用 `Get-Item` 校验精确字节数，并使用 `Get-FileHash -Algorithm SHA256` 校验哈希；任一项不匹配都会终止并报错。校验成功不代表具有发布权，尤其不得据此发布 `reference42`。
 
 ```powershell
 $expected = @(

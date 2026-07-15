@@ -29,7 +29,7 @@ TrafficAgent 是面向交通场景的本地交通标志识别应用。它用 Fas
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1 -Device auto -Start
 ```
 
-脚本会准备项目内运行时、后端虚拟环境、锁定的前端依赖、本地配置和默认模型，然后启动服务。模型附件的文件名、大小和哈希目前以 [models-v1 发布契约](docs/releases/models-v1.md) 为准；该文档在 Release 正式发布前不表示 GitHub 上已经存在这些附件，发布前模型下载步骤会失败。
+脚本会准备项目内运行时、后端虚拟环境、锁定的前端依赖、本地配置和默认模型，然后启动服务。模型附件的文件名、大小、哈希和发布资格以 [models-v1 发布契约](docs/releases/models-v1.md) 为准。当前 `reference42` 检查点缺少可核验的再分发来源，不能作为 GitHub Release 附件发布；在清单和发布资源调整完成前，默认模型下载步骤会失败。
 
 启动后访问：
 
@@ -67,11 +67,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.
 
 | 文件 | 用途 | 状态 |
 | --- | --- | --- |
-| `models/tt100k-yolo11s-reference42.pt` | TT100K 42 类街景检测 + common-45 映射 | 默认检测器 |
-| `models/gtsrb-yolo11n-cls.pt` | GTSRB 43 类裁剪图分类 | 默认分类器 |
-| `models/tt100k-yolo11n-common45.pt` | 项目训练的 common-45 检测器 | 可选，不由默认下载流程安装 |
+| `models/tt100k-yolo11s-reference42.pt` | TT100K 42 类街景检测 + common-45 映射 | 本地运行默认；禁止发布，直至再分发来源完备 |
+| `models/gtsrb-yolo11n-cls.pt` | GTSRB 43 类裁剪图分类 | 本地运行默认；发布前核验训练与数据来源 |
+| `models/tt100k-yolo11n-common45.pt` | 项目训练的 common-45 检测器 | 可选；发布受 TT100K 数据集条款约束 |
 
-默认 42 类检测器没有训练 `ph5`、`w32`、`wo`，因此不能可靠检测这三类。common45 属于可选附件，不在 bootstrap 的默认下载列表中。`models-v1` Release 发布后，先从清单下载并验证它：
+默认 42 类检测器没有训练 `ph5`、`w32`、`wo`，因此不能可靠检测这三类。common45 属于可选附件，不在 bootstrap 的默认下载列表中。仅当 `models-v1` Release 按发布契约完成授权核验并实际发布后，才可从清单下载并验证它：
 
 ```powershell
 $manifest = Get-Content .\scripts\config\bootstrap-manifest.json -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -138,4 +138,4 @@ try {
 
 ## 许可证
 
-本仓库按 [GNU Affero General Public License v3.0](LICENSE) 发布。Ultralytics 官方许可说明要求：使用其 YOLO 代码或模型时，整个项目需按 AGPL-3.0 开源，或另行取得 Ultralytics Enterprise License。具体第三方和数据集条款见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+仓库源代码按 [GNU Affero General Public License v3.0](LICENSE) 发布。该软件许可不授予 TT100K 数据或 TT100K 派生权重的使用、商业使用或再分发权。TT100K 官方页面将数据集标为 [CC BY-NC](https://cg.cs.tsinghua.edu.cn/traffic-sign/)；Ultralytics 组件另受其 AGPL-3.0 或企业许可要求约束。模型发布必须同时满足软件、训练数据和模型来源条款，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。

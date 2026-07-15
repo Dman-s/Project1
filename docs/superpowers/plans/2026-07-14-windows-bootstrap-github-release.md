@@ -8,6 +8,8 @@
 
 **Tech Stack:** Windows PowerShell 5.1, Python 3.10.11, PyTorch 2.11.0, FastAPI, Node.js 24.18.0, React/Vite, GitHub Actions, GitHub CLI
 
+**Portable placeholders:** `$PROJECT_ROOT` is the repository root. `$REFERENCE_MODEL_SOURCE` is a local source directory whose provenance and redistribution permission have been verified.
+
 ---
 
 ## File Map
@@ -36,7 +38,7 @@
 - `.github/ISSUE_TEMPLATE/bug_report.yml`: reproducible bug report form.
 - `.github/ISSUE_TEMPLATE/feature_request.yml`: feature request form.
 - `.github/pull_request_template.md`: verification checklist.
-- `THIRD_PARTY_NOTICES.md`: Ultralytics/model provenance and AGPL-3.0 notices.
+- `THIRD_PARTY_NOTICES.md`: separate software, model, and dataset terms, including model provenance and redistribution gates.
 
 ## Task 1: Isolate Work and Establish Repository Hygiene
 
@@ -46,13 +48,13 @@
 
 - [ ] **Step 1: Create an isolated worktree from the approved design commit**
 
-Run from `D:\Project1-main1`:
+Run from `$PROJECT_ROOT`:
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 worktree add .worktrees/windows-bootstrap -b codex/windows-bootstrap-release HEAD
+git -c safe.directory="$PROJECT_ROOT" worktree add .worktrees/windows-bootstrap -b codex/windows-bootstrap-release HEAD
 ```
 
-Expected: the worktree is created at `D:\Project1-main1\.worktrees\windows-bootstrap` and the current untracked datasets/archives remain only in the original worktree.
+Expected: the worktree is created at `$PROJECT_ROOT\.worktrees\windows-bootstrap` and the current untracked datasets/archives remain only in the original worktree.
 
 - [ ] **Step 2: Record the failing ignore checks**
 
@@ -60,7 +62,7 @@ Run:
 
 ```powershell
 git check-ignore frontend/package-lock.json
-git check-ignore .runtime/state/backend.pid models/tt100k-yolo11s-reference42.pt .codex-tmp-tt100k.html Train.tar qq_3045834499
+git check-ignore .runtime/state/backend.pid models/tt100k-yolo11s-reference42.pt .codex-tmp-tt100k.html Train.tar reference-model-source
 ```
 
 Expected before editing: `frontend/package-lock.json` is incorrectly ignored; at least `.runtime/` and the root reference directory do not have explicit project-level rules.
@@ -76,7 +78,7 @@ Remove `package-lock.json` from the Node lock ignores. Add root-local rules for:
 /backend-*.log
 /frontend-*.log
 /Train.tar
-/qq_3045834499/
+/reference-model-source/
 /*.zip
 ```
 
@@ -89,7 +91,7 @@ Run:
 ```powershell
 git check-ignore frontend/package-lock.json
 if ($LASTEXITCODE -eq 0) { throw 'package-lock.json is still ignored' }
-git check-ignore .runtime/state/backend.pid models/example.pt .codex-tmp-tt100k.html Train.tar qq_3045834499
+git check-ignore .runtime/state/backend.pid models/example.pt .codex-tmp-tt100k.html Train.tar reference-model-source
 git add .gitignore frontend/package-lock.json
 git diff --cached --check
 ```
@@ -207,13 +209,12 @@ Use these exact runtime values:
 
 Add model records for:
 
-- `tt100k-yolo11s-reference42.pt`, SHA-256 `E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88`, default detector.
-- `tt100k-yolo11n-common45.pt`, 5,488,602 bytes, SHA-256 `A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13`, optional detector.
-- `gtsrb-yolo11n-cls.pt`, 3,291,010 bytes, SHA-256 `323E5BD1B0DC5D1F6FBB4C487FAF2320DA0DF9C21132DD46C0C94FEE7B33B16C`, default classifier.
+- `tt100k-yolo11s-reference42.pt`, SHA-256 `E8A0E0F1E5A9004C708D7EEE9EDD97E9E9D0A7986023E96C807D0FFCD3D50F88`, local default detector; publication blocked until provenance and redistribution permission are documented.
+- `tt100k-yolo11n-common45.pt`, 5,488,602 bytes, SHA-256 `A73829F11BD5AC940BDD1DF982095AE6F828180B0C3D55285BCDBB9333154D13`, optional detector subject to TT100K CC BY-NC and Ultralytics terms.
+- `gtsrb-yolo11n-cls.pt`, 3,291,010 bytes, SHA-256 `323E5BD1B0DC5D1F6FBB4C487FAF2320DA0DF9C21132DD46C0C94FEE7B33B16C`, local default classifier pending provenance review.
 
-The default detector is 19,231,379 bytes. Each URL is
-`https://github.com/Dman-s/Project1/releases/download/models-v1/<fileName>` and each
-record includes purpose, source, license, and byte count.
+The default detector is 19,231,379 bytes. Candidate URLs follow
+`https://github.com/Dman-s/Project1/releases/download/models-v1/<fileName>`, but a URL must not be activated for a blocked asset. Each record includes purpose, source, license, and byte count; a single license field is not proof that software, dataset, and model redistribution terms are all satisfied.
 
 
 - [ ] **Step 2: Write failing helper tests**
@@ -389,7 +390,7 @@ git commit -m "Add Windows diagnostics and process controls"
 
 ```powershell
 $trackedDocs = @('README.md', 'docs/windows-setup.md', 'docs/local-development.md', 'backend/.env.local.example')
-rg -n 'D:\\Project1-main1|qq_3045834499|local-dev-secret-change-before-production' $trackedDocs
+rg -n '[A-Z]:\\|local-dev-secret-change-before-production' $trackedDocs
 ```
 
 Expected before editing: machine-specific/reference paths and a fixed development JWT are found.
@@ -406,16 +407,16 @@ Lead with the actual traffic-sign application, include features, Windows require
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1 -Device auto -Start
 ```
 
-Document URLs, GPU/CPU overrides, model choices, tests, project layout, known 42-class model gaps, and links to setup/training docs. Add `docs/releases/models-v1.md` with the three exact filenames, byte counts, hashes, measured metrics already recorded in local development docs, provenance, AGPL-3.0 notice, and missing-class limitations. Do not claim a feature or release exists until verified.
+Document URLs, GPU/CPU overrides, model choices, tests, project layout, known 42-class model gaps, and links to setup/training docs. Add `docs/releases/models-v1.md` with exact filenames, byte counts, hashes, measured metrics, provenance, separate software/data/model terms, publication status, and missing-class limitations. Do not claim a feature, redistribution right, or release exists until verified.
 
 - [ ] **Step 4: Add full setup/troubleshooting and third-party notices**
 
-Cover proxy settings, download retry, hash mismatch, NVIDIA driver requirements, forced CPU install, missing models, port conflicts, logs, stop behavior, and clean reinstall. Attribute Ultralytics and the reference TT100K model under AGPL-3.0; explain that repository users must review third-party terms.
+Cover proxy settings, download retry, hash mismatch, NVIDIA driver requirements, forced CPU install, missing models, port conflicts, logs, stop behavior, and clean reinstall. Document Ultralytics obligations separately from TT100K's official CC BY-NC terms and citation. Block any reference checkpoint whose training lineage and redistribution authorization are not documented.
 
 - [ ] **Step 5: Run portability and link checks**
 
 ```powershell
-rg -n 'D:\\Project1-main1|qq_3045834499|local-dev-secret-change-before-production' README.md docs/windows-setup.md docs/local-development.md backend/.env.local.example
+rg -n '[A-Z]:\\|local-dev-secret-change-before-production' README.md docs/windows-setup.md docs/local-development.md backend/.env.local.example
 git diff --check
 ```
 
@@ -474,20 +475,20 @@ git add .github
 git commit -m "Add repository CI and contribution templates"
 ```
 
-## Task 8: Stage Model Release Assets and Run End-to-End Verification
+## Task 8: Stage Local Model Candidates and Run End-to-End Verification
 
 **Files:**
 - Local only: `.runtime/release/models-v1/*.pt`
 - Modify if measured metadata differs: `scripts/config/bootstrap-manifest.json`
 
-- [ ] **Step 1: Copy release assets from approved local sources**
+- [ ] **Step 1: Copy local candidates from approved sources**
 
 From the original workspace, copy without modifying the sources:
 
 ```powershell
-Copy-Item D:\Project1-main1\qq_3045834499\yolo11-tt100k\42_demo\runs\yolo11s\weights\best.pt .runtime\release\models-v1\tt100k-yolo11s-reference42.pt
-Copy-Item D:\Project1-main1\training\runs\tt100k_yolo11n_gpu\weights\best.pt .runtime\release\models-v1\tt100k-yolo11n-common45.pt
-Copy-Item D:\Project1-main1\training\runs\gtsrb_yolo11n_cls_gpu_final\weights\best.pt .runtime\release\models-v1\gtsrb-yolo11n-cls.pt
+Copy-Item "$REFERENCE_MODEL_SOURCE\weights\best.pt" .runtime\release\models-v1\tt100k-yolo11s-reference42.pt
+Copy-Item "$PROJECT_ROOT\training\runs\tt100k_yolo11n_gpu\weights\best.pt" .runtime\release\models-v1\tt100k-yolo11n-common45.pt
+Copy-Item "$PROJECT_ROOT\training\runs\gtsrb_yolo11n_cls_gpu_final\weights\best.pt" .runtime\release\models-v1\gtsrb-yolo11n-cls.pt
 ```
 
 - [ ] **Step 2: Verify all release hashes and sizes**
@@ -497,13 +498,13 @@ Get-ChildItem .runtime\release\models-v1\*.pt | Get-FileHash -Algorithm SHA256
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/run.ps1
 ```
 
-Expected hashes exactly match Task 3. Update only byte counts in the manifest if required; any hash mismatch is fatal.
+Expected hashes exactly match Task 3. Update only byte counts in the manifest if required; any hash mismatch is fatal. Staging proves identity only and does not authorize publication.
 
 - [ ] **Step 3: Run full backend and frontend verification**
 
 ```powershell
-D:\Project1-main1\backend\.venv\Scripts\python.exe -m pytest -q backend/tests
-D:\Project1-main1\backend\.venv\Scripts\python.exe -m pip check
+& "$PROJECT_ROOT\backend\.venv\Scripts\python.exe" -m pytest -q backend/tests
+& "$PROJECT_ROOT\backend\.venv\Scripts\python.exe" -m pip check
 Set-Location frontend
 npm ci
 npm run lint
@@ -515,14 +516,14 @@ Expected: all 109 backend tests pass; pip check succeeds; all 21 frontend tests 
 
 - [ ] **Step 4: Run setup and lifecycle smoke tests**
 
-Run bootstrap `-PlanOnly`, doctor against staged models, then start and stop the existing configured app. Confirm `/api/health`, `/docs`, `/camera`, image upload from `D:\Project1-main1\Test`, and Chinese class meanings.
+Run bootstrap `-PlanOnly`, doctor against staged models, then start and stop the existing configured app. Confirm `/api/health`, `/docs`, `/camera`, image upload from `$PROJECT_ROOT\Test`, and Chinese class meanings.
 
 - [ ] **Step 5: Scan the exact publication set**
 
 ```powershell
 git diff --check
 git status --short
-git ls-files | rg '(\.env$|\.pt$|\.pth$|\.onnx$|\.db$|Train\.tar|qq_3045834499|\.codex-tmp)'
+git ls-files | rg '(\.env$|\.pt$|\.pth$|\.onnx$|\.db$|Train\.tar|\.codex-tmp)'
 git ls-tree -r -l HEAD | Sort-Object { [int64](($_ -split '\s+')[3]) } -Descending | Select-Object -First 20
 rg -n '(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|BEGIN (RSA |EC )?PRIVATE KEY)' $(git ls-files)
 ```
@@ -548,10 +549,10 @@ Use the requesting-code-review skill against the design commit through implement
 
 - [ ] **Step 2: Merge the isolated branch back to the feature branch**
 
-From `D:\Project1-main1`:
+From `$PROJECT_ROOT`:
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 merge --ff-only codex/windows-bootstrap-release
+git -c safe.directory="$PROJECT_ROOT" merge --ff-only codex/windows-bootstrap-release
 ```
 
 Expected: fast-forward succeeds and original untracked local assets remain untouched.
@@ -561,7 +562,7 @@ Expected: fast-forward succeeds and original untracked local assets remain untou
 ```powershell
 gh auth status
 gh auth login --web --git-protocol https
-git -c safe.directory=D:/Project1-main1 fetch origin --prune
+git -c safe.directory="$PROJECT_ROOT" fetch origin --prune
 ```
 
 Only run login when status is unauthenticated. Inspect `origin/main`, `origin/feature/tt100k-training`, and ancestry before integration.
@@ -573,8 +574,8 @@ If local HEAD contains `origin/main`, fast-forward/create local `main` at HEAD. 
 - [ ] **Step 5: Push source branches**
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 push origin feature/tt100k-training
-git -c safe.directory=D:/Project1-main1 push origin main
+git -c safe.directory="$PROJECT_ROOT" push origin feature/tt100k-training
+git -c safe.directory="$PROJECT_ROOT" push origin main
 ```
 
 Expected: both pushes succeed and remote `main` resolves to the verified integration commit.
@@ -586,16 +587,19 @@ gh repo edit Dman-s/Project1 --description "Windows-native YOLO11 traffic-sign d
 gh repo edit Dman-s/Project1 --add-topic yolo11 --add-topic traffic-sign-detection --add-topic fastapi --add-topic react --add-topic pytorch --add-topic computer-vision
 ```
 
-- [ ] **Step 7: Create the model release**
+- [ ] **Step 7: Create the model release from approved assets only**
+
+Do not run this step until `docs/releases/models-v1.md` marks every selected asset as publishable and its provenance record is complete. Exclude `tt100k-yolo11s-reference42.pt` unless its redistribution gate has been resolved.
 
 ```powershell
-gh release create models-v1 .runtime/release/models-v1/*.pt --repo Dman-s/Project1 --title "Traffic sign models v1" --notes-file docs/releases/models-v1.md
+$APPROVED_MODEL_ASSETS = @('<path-to-approved-model-1>', '<path-to-approved-model-2>')
+gh release create models-v1 $APPROVED_MODEL_ASSETS --repo Dman-s/Project1 --title "Traffic sign models v1" --notes-file docs/releases/models-v1.md
 ```
 
 If the tag already exists, first run `gh release view models-v1 --repo Dman-s/Project1 --json assets,tagName,url`. Only when it is this project's model release and the local hashes match the manifest, run:
 
 ```powershell
-gh release upload models-v1 '.runtime/release/models-v1/*.pt' --repo Dman-s/Project1 --clobber
+gh release upload models-v1 $APPROVED_MODEL_ASSETS --repo Dman-s/Project1 --clobber
 ```
 
 - [ ] **Step 8: Verify GitHub and a clean clone**
@@ -613,8 +617,8 @@ Clone into `.runtime/verification/Project1`, verify commit and README, run Power
 After all GitHub checks pass and the branch is merged:
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 worktree remove .worktrees/windows-bootstrap
-git -c safe.directory=D:/Project1-main1 branch -d codex/windows-bootstrap-release
+git -c safe.directory="$PROJECT_ROOT" worktree remove .worktrees/windows-bootstrap
+git -c safe.directory="$PROJECT_ROOT" branch -d codex/windows-bootstrap-release
 ```
 
 Do not remove the worktree if publication or verification remains incomplete.

@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.10, FastAPI, SQLAlchemy, pytest, React/Vitest, Ultralytics/SAHI runtime
 
+**Portable path:** `$PROJECT_ROOT` denotes the repository root in all commands and examples.
+
 ---
 
 ### Task 1: Add the canonical TT100K Chinese label map
@@ -44,7 +46,7 @@ def test_representative_tt100k_codes_have_real_chinese_meanings():
 Run:
 
 ```powershell
-cd D:\Project1-main1\backend
+Set-Location "$PROJECT_ROOT\backend"
 .\.venv\Scripts\python.exe -m pytest tests\test_tt100k_labels.py -q
 ```
 
@@ -126,8 +128,8 @@ Expected: all label and detector tests pass.
 - [ ] **Step 5: Commit the label source**
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 add backend/app/services/tt100k_labels.py backend/tests/test_tt100k_labels.py
-git -c safe.directory=D:/Project1-main1 commit -m "Add TT100K Chinese label meanings"
+git -c safe.directory="$PROJECT_ROOT" add backend/app/services/tt100k_labels.py backend/tests/test_tt100k_labels.py
+git -c safe.directory="$PROJECT_ROOT" commit -m "Add TT100K Chinese label meanings"
 ```
 
 ### Task 2: Populate Chinese names in immediate detection results and scene metadata
@@ -224,8 +226,8 @@ Expected: all tests pass; TT100K results expose Chinese names and GTSRB still us
 - [ ] **Step 5: Commit immediate-result support**
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 add backend/app/services/detection_task_service.py backend/tests/test_detection_task_service.py
-git -c safe.directory=D:/Project1-main1 commit -m "Expose Chinese TT100K detection names"
+git -c safe.directory="$PROJECT_ROOT" add backend/app/services/detection_task_service.py backend/tests/test_detection_task_service.py
+git -c safe.directory="$PROJECT_ROOT" commit -m "Expose Chinese TT100K detection names"
 ```
 
 ### Task 3: Translate persisted task-history results without migration
@@ -319,8 +321,8 @@ Expected: API tests and all 10 frontend tests pass; no frontend mapping change i
 - [ ] **Step 5: Commit history support**
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 add backend/app/api/sign_analyzer.py backend/tests/test_sign_analyzer.py
-git -c safe.directory=D:/Project1-main1 commit -m "Translate TT100K task history labels"
+git -c safe.directory="$PROJECT_ROOT" add backend/app/api/sign_analyzer.py backend/tests/test_sign_analyzer.py
+git -c safe.directory="$PROJECT_ROOT" commit -m "Translate TT100K task history labels"
 ```
 
 ### Task 4: Full verification and real screenshot-case smoke test
@@ -331,7 +333,7 @@ git -c safe.directory=D:/Project1-main1 commit -m "Translate TT100K task history
 - [ ] **Step 1: Run the full automated suite**
 
 ```powershell
-cd D:\Project1-main1\backend
+Set-Location "$PROJECT_ROOT\backend"
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m pip check
 cd ..\frontend
@@ -349,15 +351,15 @@ Expected: `GET http://127.0.0.1:8000/api/health/detail` returns `data.status=hea
 
 - [ ] **Step 3: Re-run the screenshot image through the authenticated API**
 
-Upload `D:\Project1-main1\training\raw\tt100k\data\train\1395.jpg` to `POST /api/sign-analyzer/analyze` with `mode=detect`.
+Upload `$PROJECT_ROOT\training\raw\tt100k\data\train\1395.jpg` to `POST /api/sign-analyzer/analyze` with `mode=detect`.
 
 Expected detections keep raw codes in `class_name`, while each known result has non-empty `class_name_cn` and matching `display_name`; representative results include readable meanings such as `禁止小型客车驶入` and `禁止向左转弯`.
 
 - [ ] **Step 4: Verify workspace and final diff**
 
 ```powershell
-git -c safe.directory=D:/Project1-main1 diff --check
-git -c safe.directory=D:/Project1-main1 status --short
+git -c safe.directory="$PROJECT_ROOT" diff --check
+git -c safe.directory="$PROJECT_ROOT" status --short
 ```
 
 Expected: no whitespace errors; user-owned archives, TT100K reference folder, and temporary source files remain untracked and untouched.

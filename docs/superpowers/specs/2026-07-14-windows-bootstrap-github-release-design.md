@@ -94,8 +94,8 @@ Windows Update、PostgreSQL、Redis 或 MinIO，优先使用 NVIDIA GPU，并在
 - 添加 Issue 模板和 Pull Request 模板。仓库描述设置为 Windows 本地运行的
   YOLO11 交通标志检测平台，Topics 包含 `yolo11`、`traffic-sign-detection`、
   `fastapi`、`react`、`pytorch`、`computer-vision`。
-- 不擅自添加新的项目许可证。README 明确 Ultralytics 及模型相关的 AGPL-3.0
-  依赖信息，并保留第三方来源归属。
+- 仓库源代码许可、Ultralytics 义务、训练数据条款和模型再分发资格分别说明。
+  TT100K 按官方 CC BY-NC 条款署名并引用；来源链或授权不完整的检查点不得发布。
 
 ## GitHub 发布流程
 
@@ -104,7 +104,8 @@ Windows Update、PostgreSQL、Redis 或 MinIO，优先使用 NVIDIA GPU，并在
 3. 获取远端 `main`，正常合并当前分支并再次运行关键测试。
 4. 推送功能分支和 `main`，不使用 `--force`。
 5. 使用已登录的 GitHub CLI 更新仓库描述、Topics、Issues 配置和其他元数据。
-6. 创建或更新 `models-v1` Release，上传三个模型附件和模型清单。
+6. 仅为来源链和再分发授权均已核验的模型创建或更新 `models-v1` Release；
+   未通过发布门禁的检查点不得上传。
 7. 从 GitHub 新目录克隆仓库，执行引导脚本的全新安装冒烟测试。
 
 如果 GitHub CLI 未登录，代码推送可在凭据管理器可用时继续，但元数据和 Release
