@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from sqlalchemy import inspect
 from sqlalchemy.orm import sessionmaker
 
@@ -25,6 +26,11 @@ def test_local_settings_disable_optional_services_by_default():
     assert settings.database_url == "sqlite:///./data/local.db"
     assert settings.redis_enabled is False
     assert settings.minio_enabled is False
+
+
+def test_settings_reject_bootstrap_jwt_marker():
+    with pytest.raises(ValueError, match="generated-by-bootstrap"):
+        Settings(_env_file=None, JWT_SECRET_KEY="generated-by-bootstrap")
 
 
 def test_production_settings_keep_postgres_and_optional_services():

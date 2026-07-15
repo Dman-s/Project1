@@ -235,14 +235,9 @@ function Get-DoctorPythonInfo {
     )
 
     $expectedVersion = [string]$Manifest.runtime.python.version
+    $resolvedLocalPythonPath = $null
     if (Test-Path -LiteralPath $Paths.LocalPythonPath -PathType Leaf) {
-        $resolvedPythonPath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $Paths.LocalPythonPath -ProjectRoot $Paths.Root -RuntimeName "Python"
-        $version = Get-DoctorExactPythonVersion -PythonPath $resolvedPythonPath -ProjectRoot $Paths.Root -TimeoutSeconds 15
-        return [pscustomobject]@{
-            Version = $version
-            Path = $resolvedPythonPath
-            Source = "project-local"
-        }
+        $resolvedLocalPythonPath = Assert-DoctorRuntimeExecutablePath -ExecutablePath $Paths.LocalPythonPath -ProjectRoot $Paths.Root -RuntimeName "Python"
     }
 
     if (Test-Path -LiteralPath $Paths.VenvPythonPath -PathType Leaf) {
@@ -252,6 +247,15 @@ function Get-DoctorPythonInfo {
             Version = $version
             Path = $resolvedPythonPath
             Source = "backend-venv"
+        }
+    }
+
+    if ($null -ne $resolvedLocalPythonPath) {
+        $version = Get-DoctorExactPythonVersion -PythonPath $resolvedLocalPythonPath -ProjectRoot $Paths.Root -TimeoutSeconds 15
+        return [pscustomobject]@{
+            Version = $version
+            Path = $resolvedLocalPythonPath
+            Source = "project-local"
         }
     }
 
@@ -645,7 +649,7 @@ function Invoke-DoctorMain {
     $pythonInfo = $null
     try {
         $pythonInfo = Get-DoctorPythonInfo -Paths $paths -Manifest $manifest
-        $pythonStatus = if ($pythonInfo.Source -eq "project-local") { "PASS" } else { "WARN" }
+        $pythonStatus = if ($pythonInfo.Source -in @("project-local", "backend-venv")) { "PASS" } else { "WARN" }
         if ([string]$pythonInfo.Version -eq [string]$manifest.runtime.python.version) {
             $results.Add((New-DoctorCheckResult -Name "python-version" -Status $pythonStatus -Message "Python $($pythonInfo.Version) resolved from $($pythonInfo.Source)." -Required $true))
         } else {
@@ -777,7 +781,8 @@ function Invoke-DoctorMain {
         if ([string]$envMap["MINIO_ENABLED"] -ne "false") { $envIssues += "MINIO_ENABLED=false" }
         if ([string]::IsNullOrWhiteSpace([string]$envMap["YOLO_MODEL_PATH"])) { $envIssues += "YOLO_MODEL_PATH" }
         if ([string]::IsNullOrWhiteSpace([string]$envMap["GTSRB_MODEL_PATH"])) { $envIssues += "GTSRB_MODEL_PATH" }
-        if ([string]::IsNullOrWhiteSpace([string]$envMap["JWT_SECRET_KEY"])) { $envIssues += "JWT_SECRET_KEY" }
+        $jwtSecret = [string]$envMap["JWT_SECRET_KEY"]
+        if ([string]::IsNullOrWhiteSpace($jwtSecret) -or $jwtSecret -eq "generated-by-bootstrap") { $envIssues += "JWT_SECRET_KEY" }
 
         if ($envIssues.Count -eq 0) {
             $results.Add((New-DoctorCheckResult -Name "backend-env" -Status "PASS" -Message "backend/.env local configuration is present." -Required $true))

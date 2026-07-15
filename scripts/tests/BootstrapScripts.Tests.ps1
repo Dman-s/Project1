@@ -3071,6 +3071,36 @@ exit 0
             }
         },
         @{
+            Name = "Doctor prefers the dependency-bearing backend venv over the base runtime"
+            Body = {
+                $fixture = New-DoctorFixture
+                try {
+                    $basePythonPath = Join-Path $fixture ".runtime\python\python.exe"
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $basePythonPath) -Force | Out-Null
+                    [System.IO.File]::WriteAllText($basePythonPath, "fixture-base-python", [System.Text.Encoding]::ASCII)
+                    $doctorScriptPath = (Get-DoctorScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$doctorScriptPath'
+function Get-DoctorExactPythonVersion {
+    param([string]`$PythonPath, [string]`$ProjectRoot, [int]`$TimeoutSeconds)
+    return '3.10.11'
+}
+`$paths = Resolve-DoctorPaths -RootPath '$escapedFixture'
+`$info = Get-DoctorPythonInfo -Paths `$paths -Manifest ([pscustomobject]@{ runtime = [pscustomobject]@{ python = [pscustomobject]@{ version = '3.10.11' } } })
+[ordered]@{ Source = `$info.Source; Path = `$info.Path } | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $info = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected "backend-venv" -Actual ([string]$info.Source) -Message "Doctor should run dependency probes with backend/.venv Python."
+                    Assert-Equal -Expected (Join-Path $fixture "backend\.venv\Scripts\python.exe") -Actual ([string]$info.Path) -Message "Doctor selected the wrong Python executable."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "Doctor fake fixture passes and human and JSON output stay secret-free"
             Body = {
                 $fixture = New-DoctorFixture
@@ -3138,6 +3168,14 @@ function Get-DoctorTorchInfo {
                     Assert-Contains -ExpectedSubstring '"status":"PASS"' -Actual $state.Json -Message "Doctor JSON output should contain PASS records."
                     Assert-False -Condition ($state.Human.Contains("super-secret-fixture-value")) -Message "Doctor human output leaked the fixture secret."
                     Assert-False -Condition ($state.Json.Contains("super-secret-fixture-value")) -Message "Doctor JSON output leaked the fixture secret."
+
+                    $envPath = Join-Path $fixture "backend\.env"
+                    $envContent = (Get-Content -LiteralPath $envPath -Raw -Encoding UTF8).Replace("super-secret-fixture-value", "generated-by-bootstrap")
+                    Set-Content -LiteralPath $envPath -Value $envContent -Encoding UTF8
+                    $markerResult = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $markerState = $markerResult.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected 1 -Actual ([int]$markerState.ExitCode) -Message "Doctor must reject the bootstrap JWT template marker."
+                    Assert-Contains -ExpectedSubstring '"name":"backend-env","status":"FAIL"' -Actual ([string]$markerState.Json) -Message "Doctor should report backend-env failure for the JWT marker."
                 } finally {
                     Remove-TempFixture -Path $fixture
                 }

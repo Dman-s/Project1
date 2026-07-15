@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -126,6 +126,13 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "your-super-secret-key-change-in-production"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    @field_validator("JWT_SECRET_KEY")
+    @classmethod
+    def reject_bootstrap_secret_marker(cls, value: str) -> str:
+        if value.strip() == "generated-by-bootstrap":
+            raise ValueError("JWT_SECRET_KEY must not use generated-by-bootstrap")
+        return value
     # ── 百度OCR API 配置 ──────────────────────────────
     BAIDU_API_KEY: str = "your-baidu-api-key"
     BAIDU_SECRET_KEY: str = "your-baidu-secret-key"

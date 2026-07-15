@@ -715,19 +715,41 @@ function Get-ProjectEnvironmentTests {
                 $env:UNRELATED_SECRET_TOKEN = "should-not-leak"
                 try {
                     $content = New-LocalEnvContent -JwtSecretKey "local-secret-value" -YoloDevice "gpu" -GtsrbDevice "cpu"
-                    $expected = @(
-                        "APP_MODE=local",
-                        "DATABASE_URL=sqlite:///./data/local.db",
-                        "REDIS_ENABLED=false",
-                        "MINIO_ENABLED=false",
-                        "YOLO_MODEL_PATH=../models/tt100k-yolo11s-reference42.pt",
-                        "YOLO_DEVICE=gpu",
-                        "GTSRB_MODEL_PATH=../models/gtsrb-yolo11n-cls.pt",
-                        "GTSRB_DEVICE=cpu",
-                        "JWT_SECRET_KEY=local-secret-value"
-                    ) -join "`r`n"
+                    $resolvedModulePath = (Resolve-Path -LiteralPath $ModulePath).Path
+                    $projectRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $resolvedModulePath))
+                    $publicTemplatePath = Join-Path $projectRoot "backend\.env.local.example"
+                    $expectedLines = @([System.IO.File]::ReadAllLines($publicTemplatePath, [System.Text.Encoding]::UTF8) | ForEach-Object {
+                        $line = $_.Trim()
+                        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) { return }
+                        if ($line.StartsWith("YOLO_DEVICE=")) { return "YOLO_DEVICE=gpu" }
+                        if ($line.StartsWith("GTSRB_DEVICE=")) { return "GTSRB_DEVICE=cpu" }
+                        if ($line.StartsWith("JWT_SECRET_KEY=")) { return "JWT_SECRET_KEY=local-secret-value" }
+                        return $line
+                    })
+                    $expected = $expectedLines -join "`r`n"
                     Assert-Equal -Expected ($expected + "`r`n") -Actual $content -Message "Local env content mismatch."
+                    Assert-Contains -ExpectedSubstring "YOLO_USE_SAHI=true" -Actual $content -Message "Public template must keep SAHI enabled for the default detector."
+                    Assert-Contains -ExpectedSubstring "YOLO_MODEL_NAME=tt100k-yolo11s-reference42" -Actual $content -Message "Public template must identify the default detector."
                     Assert-False -Condition ($content.Contains("should-not-leak")) -Message "Unexpected environment leak."
+
+                    $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N") + ".env.example")
+                    try {
+                        [System.IO.File]::WriteAllLines($templatePath, @(
+                            "# fixture",
+                            "YOLO_DEVICE=auto",
+                            "GTSRB_DEVICE=auto",
+                            "YOLO_CONFIDENCE=0.61",
+                            "JWT_SECRET_KEY=generated-by-bootstrap"
+                        ), (New-Object System.Text.UTF8Encoding($false)))
+                        $fromTemplate = New-LocalEnvContent -JwtSecretKey "fixture-secret" -YoloDevice "gpu" -GtsrbDevice "cpu" -TemplatePath $templatePath
+                        Assert-Contains -ExpectedSubstring "YOLO_CONFIDENCE=0.61" -Actual $fromTemplate -Message "Generated env should preserve template-owned settings."
+                        Assert-Contains -ExpectedSubstring "YOLO_DEVICE=gpu" -Actual $fromTemplate -Message "Generated env should replace the YOLO device."
+                        Assert-Contains -ExpectedSubstring "GTSRB_DEVICE=cpu" -Actual $fromTemplate -Message "Generated env should replace the GTSRB device."
+                        Assert-Contains -ExpectedSubstring "JWT_SECRET_KEY=fixture-secret" -Actual $fromTemplate -Message "Generated env should replace the JWT marker."
+                        Assert-False -Condition $fromTemplate.Contains("generated-by-bootstrap") -Message "Generated env must not retain the JWT marker."
+                    } finally {
+                        Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
+                    }
                 } finally {
                     $env:UNRELATED_SECRET_TOKEN = $previous
                 }

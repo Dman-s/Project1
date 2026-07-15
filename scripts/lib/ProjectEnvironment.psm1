@@ -418,7 +418,8 @@ function New-LocalEnvContent {
         [Alias("Secret")]
         [Parameter(Mandatory = $true)][string]$JwtSecretKey,
         [Parameter(Mandatory = $true)][string]$YoloDevice,
-        [Parameter(Mandatory = $true)][string]$GtsrbDevice
+        [Parameter(Mandatory = $true)][string]$GtsrbDevice,
+        [string]$TemplatePath = (Join-Path $PSScriptRoot "..\..\backend\.env.local.example")
     )
 
     if ([string]::IsNullOrWhiteSpace($JwtSecretKey)) {
@@ -435,19 +436,51 @@ function New-LocalEnvContent {
         throw "Unsupported GTSRB device mode: $GtsrbDevice"
     }
 
-    $lines = @(
-        "APP_MODE=local",
-        "DATABASE_URL=sqlite:///./data/local.db",
-        "REDIS_ENABLED=false",
-        "MINIO_ENABLED=false",
-        "YOLO_MODEL_PATH=../models/tt100k-yolo11s-reference42.pt",
-        "YOLO_DEVICE=$normalizedYoloDevice",
-        "GTSRB_MODEL_PATH=../models/gtsrb-yolo11n-cls.pt",
-        "GTSRB_DEVICE=$normalizedGtsrbDevice",
-        "JWT_SECRET_KEY=$JwtSecretKey"
-    )
+    $resolvedTemplatePath = [System.IO.Path]::GetFullPath($TemplatePath)
+    if (-not (Test-Path -LiteralPath $resolvedTemplatePath -PathType Leaf)) {
+        throw "Local environment template is missing: $resolvedTemplatePath"
+    }
 
-    return ($lines -join "`r`n") + "`r`n"
+    $lines = New-Object System.Collections.Generic.List[string]
+    $seenKeys = @{}
+    foreach ($rawLine in [System.IO.File]::ReadAllLines($resolvedTemplatePath, [System.Text.Encoding]::UTF8)) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) {
+            continue
+        }
+
+        $separator = $line.IndexOf("=")
+        if ($separator -le 0) {
+            throw "Invalid local environment template line: $line"
+        }
+
+        $key = $line.Substring(0, $separator).Trim()
+        $value = $line.Substring($separator + 1)
+        if ($seenKeys.ContainsKey($key)) {
+            throw "Duplicate local environment template key: $key"
+        }
+        $seenKeys[$key] = $true
+
+        switch ($key) {
+            "YOLO_DEVICE" { $value = $normalizedYoloDevice }
+            "GTSRB_DEVICE" { $value = $normalizedGtsrbDevice }
+            "JWT_SECRET_KEY" {
+                if ($value -ne "generated-by-bootstrap") {
+                    throw "JWT_SECRET_KEY template value must be generated-by-bootstrap."
+                }
+                $value = $JwtSecretKey
+            }
+        }
+        $lines.Add("$key=$value")
+    }
+
+    foreach ($requiredKey in @("YOLO_DEVICE", "GTSRB_DEVICE", "JWT_SECRET_KEY")) {
+        if (-not $seenKeys.ContainsKey($requiredKey)) {
+            throw "Local environment template is missing $requiredKey."
+        }
+    }
+
+    return ($lines.ToArray() -join "`r`n") + "`r`n"
 }
 
 function Test-PathInsideRoot {
