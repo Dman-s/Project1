@@ -1565,6 +1565,47 @@ try {
             }
         },
         @{
+            Name = "Invoke-DownloadWithHashValidation bounds every HTTP attempt"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+`$script:timeouts = New-Object System.Collections.Generic.List[int]
+function Invoke-WebRequest {
+    [CmdletBinding()]
+    param(
+        [string]`$Uri,
+        [string]`$OutFile,
+        [switch]`$UseBasicParsing,
+        [int]`$TimeoutSec = 0
+    )
+    `$script:timeouts.Add(`$TimeoutSec)
+    throw 'bounded-download-fixture'
+}
+`$paths = [pscustomobject]@{
+    Directory = (Join-Path '$escapedFixture' '.runtime\downloads')
+    FinalPath = (Join-Path '$escapedFixture' '.runtime\downloads\payload.zip')
+    PartialPath = (Join-Path '$escapedFixture' '.runtime\downloads\payload.zip.partial')
+}
+try {
+    `$null = Invoke-DownloadWithHashValidation -RootPath '$escapedFixture' -Url 'https://example.invalid/payload.zip' -ExpectedSha256 ('A' * 64) -DownloadPaths `$paths
+} catch {
+}
+[ordered]@{ Timeouts = @(`$script:timeouts) } | ConvertTo-Json -Compress
+"@
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $state = $result.StdOut | ConvertFrom-Json
+                    Assert-Equal -Expected @(300, 300, 300) -Actual @($state.Timeouts | ForEach-Object { [int]$_ }) -Message "Each HTTP retry should use the bounded request timeout."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "Controlled non-PlanOnly workflow runs the full success orchestration in order"
             Body = {
                 $fixture = New-BootstrapFixture

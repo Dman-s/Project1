@@ -1150,6 +1150,62 @@ Start-Sleep -Seconds 30
             }
         },
         @{
+            Name = "Invoke-CheckedCommand cleans up descendants after the parent exits"
+            Body = {
+                $fixture = New-TempFixture
+                $grandchildPid = $null
+                try {
+                    $grandchildScript = Join-Path $fixture "detached-grandchild.ps1"
+                    $parentScript = Join-Path $fixture "short-parent.ps1"
+                    $grandchildPidPath = Join-Path $fixture "detached-grandchild.pid"
+                    "Start-Sleep -Seconds 30" | Set-Content -LiteralPath $grandchildScript -Encoding ASCII
+                    @"
+`$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+`$startInfo.FileName = Join-Path `$PSHOME 'powershell.exe'
+`$startInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "$($grandchildScript.Replace("'", "''"))"'
+`$startInfo.UseShellExecute = `$true
+`$startInfo.CreateNoWindow = `$true
+`$startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+`$child = New-Object System.Diagnostics.Process
+`$child.StartInfo = `$startInfo
+[void]`$child.Start()
+[System.IO.File]::WriteAllText('$($grandchildPidPath.Replace("'", "''"))', [string](`$child.Id), [System.Text.Encoding]::ASCII)
+`$child.Dispose()
+"@ | Set-Content -LiteralPath $parentScript -Encoding ASCII
+
+                    $filePath = Join-Path $PSHOME "powershell.exe"
+                    $result = Invoke-CheckedCommand -FilePath $filePath -ArgumentList @(
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        $parentScript
+                    ) -TimeoutSeconds 10
+
+                    Assert-Equal -Expected 0 -Actual $result.ExitCode -Message "Short parent process should exit successfully."
+                    $grandchildPidText = $null
+                    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+                        if (Test-Path -LiteralPath $grandchildPidPath -PathType Leaf) {
+                            $grandchildPidText = (Get-Content -LiteralPath $grandchildPidPath -Raw -ErrorAction SilentlyContinue)
+                            if (-not [string]::IsNullOrWhiteSpace($grandchildPidText)) {
+                                break
+                            }
+                        }
+                        Start-Sleep -Milliseconds 100
+                    }
+                    Assert-False -Condition ([string]::IsNullOrWhiteSpace($grandchildPidText)) -Message "Short parent did not publish its child PID."
+                    $grandchildPid = [int]$grandchildPidText.Trim()
+                    Start-Sleep -Milliseconds 300
+                    Assert-True -Condition ($null -eq (Get-Process -Id $grandchildPid -ErrorAction SilentlyContinue)) -Message "Checked command left a descendant running after its parent exited."
+                } finally {
+                    if ($null -ne $grandchildPid) {
+                        Stop-Process -Id $grandchildPid -Force -ErrorAction SilentlyContinue
+                    }
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "Invoke-CheckedCommand throws on non-zero exit code"
             Body = {
                 $filePath = Join-Path $PSHOME "powershell.exe"

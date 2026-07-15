@@ -525,7 +525,45 @@ namespace Project1.Windows
         private const int TCP_TABLE_OWNER_PID_LISTENER = 3;
         private const uint ERROR_INSUFFICIENT_BUFFER = 122;
         private const uint TH32CS_SNAPPROCESS = 0x00000002;
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const int JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9;
         private const int MAX_PATH = 260;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct PROCESSENTRY32
@@ -580,6 +618,21 @@ namespace Project1.Windows
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32 entry);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            IntPtr job,
+            int informationClass,
+            IntPtr information,
+            uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
         [DllImport("ntdll.dll")]
         private static extern int NtQueryInformationProcess(
             IntPtr processHandle,
@@ -596,6 +649,51 @@ namespace Project1.Windows
             int ipVersion,
             int tableClass,
             uint reserved);
+
+        public static IntPtr CreateKillOnCloseJob()
+        {
+            IntPtr job = CreateJobObject(IntPtr.Zero, null);
+            if (job == IntPtr.Zero)
+            {
+                return IntPtr.Zero;
+            }
+
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION information = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            int informationLength = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr informationPointer = Marshal.AllocHGlobal(informationLength);
+            try
+            {
+                Marshal.StructureToPtr(information, informationPointer, false);
+                if (!SetInformationJobObject(
+                    job,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    informationPointer,
+                    unchecked((uint)informationLength)))
+                {
+                    CloseHandle(job);
+                    return IntPtr.Zero;
+                }
+                return job;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(informationPointer);
+            }
+        }
+
+        public static bool AssignToJob(IntPtr job, IntPtr process)
+        {
+            return job != IntPtr.Zero && process != IntPtr.Zero && AssignProcessToJobObject(job, process);
+        }
+
+        public static void CloseJob(IntPtr job)
+        {
+            if (job != IntPtr.Zero)
+            {
+                CloseHandle(job);
+            }
+        }
 
         public static int[] GetDescendantProcessIds(int rootProcessId)
         {
@@ -963,19 +1061,35 @@ function Invoke-CheckedCommand {
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
+    $jobHandle = [System.IntPtr]::Zero
 
     try {
+        Initialize-ProjectProcessNativeMethods
+        $jobHandle = [Project1.Windows.ProcessIntrospection]::CreateKillOnCloseJob()
         [void]$process.Start()
+        if (($jobHandle -ne [System.IntPtr]::Zero) -and -not [Project1.Windows.ProcessIntrospection]::AssignToJob($jobHandle, $process.Handle)) {
+            [Project1.Windows.ProcessIntrospection]::CloseJob($jobHandle)
+            $jobHandle = [System.IntPtr]::Zero
+        }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
 
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            Stop-CheckedCommandProcessTree -Process $process
+            if ($jobHandle -ne [System.IntPtr]::Zero) {
+                [Project1.Windows.ProcessIntrospection]::CloseJob($jobHandle)
+                $jobHandle = [System.IntPtr]::Zero
+            } else {
+                Stop-CheckedCommandProcessTree -Process $process
+            }
 
             [void]$process.WaitForExit(5000)
             try {
-                [void]$stdoutTask.GetAwaiter().GetResult()
-                [void]$stderrTask.GetAwaiter().GetResult()
+                if (-not $stdoutTask.IsCompleted) {
+                    [void]$stdoutTask.Wait(5000)
+                }
+                if (-not $stderrTask.IsCompleted) {
+                    [void]$stderrTask.Wait(5000)
+                }
             } catch {
             }
 
@@ -983,10 +1097,23 @@ function Invoke-CheckedCommand {
         }
 
         $process.WaitForExit()
+        if ($jobHandle -ne [System.IntPtr]::Zero) {
+            [Project1.Windows.ProcessIntrospection]::CloseJob($jobHandle)
+            $jobHandle = [System.IntPtr]::Zero
+        }
+        if (-not $stdoutTask.IsCompleted -and -not $stdoutTask.Wait(5000)) {
+            throw "Process stdout did not close within 5 seconds: $FilePath $($startInfo.Arguments)"
+        }
+        if (-not $stderrTask.IsCompleted -and -not $stderrTask.Wait(5000)) {
+            throw "Process stderr did not close within 5 seconds: $FilePath $($startInfo.Arguments)"
+        }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
     } finally {
+        if ($jobHandle -ne [System.IntPtr]::Zero) {
+            [Project1.Windows.ProcessIntrospection]::CloseJob($jobHandle)
+        }
         $process.Dispose()
     }
 

@@ -330,7 +330,7 @@ function Invoke-DownloadWithHashValidation {
         try {
             Assert-NoReparsePointTraversal -RootPath $RootPath -Path $DownloadPaths.Directory
             Assert-NoReparsePointTraversal -RootPath $RootPath -Path $DownloadPaths.PartialPath
-            Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $DownloadPaths.PartialPath -ErrorAction Stop | Out-Null
+            Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $DownloadPaths.PartialPath -TimeoutSec 300 -ErrorAction Stop | Out-Null
             Assert-FileHash -Path $DownloadPaths.PartialPath -ExpectedSha256 $ExpectedSha256
 
             if (Test-Path -LiteralPath $DownloadPaths.FinalPath) {
