@@ -42,6 +42,14 @@ class ImagePrediction:
     annotated_jpeg: bytes
 
 
+@dataclass(frozen=True)
+class VideoFramePrediction:
+    width: int
+    height: int
+    inference_time_ms: float
+    detections: tuple[DetectedObject, ...]
+
+
 def _load_ultralytics_model(model_path: str):
     from ultralytics import YOLO
 
@@ -257,6 +265,59 @@ class LocalYoloDetector:
                 iou=iou,
                 image_size=image_size,
                 device=resolved_device,
+            )
+
+    def predict_video_frame(
+        self,
+        frame: np.ndarray,
+        *,
+        confidence: float = 0.25,
+        iou: float = 0.45,
+        image_size: int = 640,
+        device: str | None = None,
+    ) -> VideoFramePrediction:
+        """Run whole-frame YOLO inference without image encode/decode work."""
+        if (
+            not isinstance(frame, np.ndarray)
+            or frame.ndim != 3
+            or frame.shape[2] != 3
+        ):
+            raise InvalidImageError(
+                "Video frame must be a BGR image with three channels"
+            )
+        resolved_device = self.selected_device if device is None else str(device)
+        if resolved_device != "cpu" and not self._cuda_available():
+            raise ModelUnavailableError(
+                f"CUDA device {resolved_device} was requested but CUDA is unavailable"
+            )
+        with self._lock:
+            model = self._get_model_locked()
+            try:
+                results = model.predict(
+                    source=frame,
+                    conf=confidence,
+                    iou=iou,
+                    imgsz=image_size,
+                    device=resolved_device,
+                    verbose=False,
+                )
+            except Exception as exc:
+                raise ModelUnavailableError(
+                    f"YOLO video inference failed: {exc}"
+                ) from exc
+            if not results:
+                raise ModelUnavailableError(
+                    "YOLO inference returned no video-frame result"
+                )
+            result = results[0]
+            height, width = getattr(result, "orig_shape", frame.shape[:2])
+            return VideoFramePrediction(
+                width=int(width),
+                height=int(height),
+                inference_time_ms=float(
+                    getattr(result, "speed", {}).get("inference", 0.0)
+                ),
+                detections=self._convert_detections(result),
             )
 
     def warmup_realtime(self, *, image_size: int, device: str) -> None:

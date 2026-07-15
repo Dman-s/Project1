@@ -340,3 +340,58 @@ def test_realtime_prediction_bypasses_sahi_and_can_force_cpu(tmp_path):
     assert len(sahi_model.model.calls) == 1
     assert sahi_model.model.calls[0]["device"] == "cpu"
     assert sahi_model.model.calls[0]["imgsz"] == 416
+
+
+def test_video_frame_prediction_passes_bgr_array_directly_to_model(tmp_path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    model = FakeModel()
+    detector = LocalYoloDetector(
+        model_path=model_path,
+        device="auto",
+        model_factory=lambda _path: model,
+        cuda_available=lambda: True,
+    )
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+
+    prediction = detector.predict_video_frame(
+        frame,
+        confidence=0.5,
+        iou=0.45,
+        image_size=1280,
+    )
+
+    assert model.calls[0]["source"] is frame
+    assert model.calls[0]["device"] == "0"
+    assert model.calls[0]["imgsz"] == 1280
+    assert prediction.width == 32
+    assert prediction.height == 24
+    assert prediction.inference_time_ms == 12.5
+    assert prediction.detections[0].class_name == "pl60"
+    assert not hasattr(prediction, "annotated_jpeg")
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b"not-an-array",
+        np.zeros((24, 32), dtype=np.uint8),
+        np.zeros((24, 32, 4), dtype=np.uint8),
+    ],
+)
+def test_video_frame_prediction_rejects_invalid_frames_before_loading_model(
+    tmp_path,
+    frame,
+):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"checkpoint")
+    loaded = []
+    detector = LocalYoloDetector(
+        model_path=model_path,
+        model_factory=lambda path: loaded.append(path) or FakeModel(),
+    )
+
+    with pytest.raises(InvalidImageError, match="BGR"):
+        detector.predict_video_frame(frame)
+
+    assert loaded == []
