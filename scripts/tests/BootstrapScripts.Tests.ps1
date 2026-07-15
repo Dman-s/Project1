@@ -1389,6 +1389,200 @@ function Get-Command {
             }
         },
         @{
+            Name = "Default Python resolution reuses an exact PATH runtime before downloading"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+function Get-PythonCommandFromPath {
+    param([switch]`$DisableProbe)
+    'C:\compatible-path\python.exe'
+}
+function Get-ExactPythonVersion {
+    param([string]`$PythonPath)
+    '3.10.11'
+}
+function Get-PythonArchitecture {
+    param([string]`$PythonPath)
+    64
+}
+function Invoke-DownloadWithHashValidation {
+    throw 'SENTINEL-PYTHON-DOWNLOAD-CALLED'
+}
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+`$manifest = Read-BootstrapManifest -Path (Join-Path '$escapedFixture' 'scripts\config\bootstrap-manifest.json')
+Resolve-PythonRuntime -Paths `$paths -Manifest `$manifest
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Equal -Expected 'C:\compatible-path\python.exe' -Actual $result.StdOut.Trim() -Message "Default Python resolution should reuse an exact PATH runtime."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Default Python resolution reuses an exact registered runtime before downloading"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+function Get-PythonCommandFromPath {
+    param([switch]`$DisableProbe)
+    'C:\incompatible-path\python.exe'
+}
+function Get-PythonCommandsFromRegistry {
+    param([switch]`$DisableProbe)
+    @('C:\registered\python.exe')
+}
+function Get-ExactPythonVersion {
+    param([string]`$PythonPath)
+    if (`$PythonPath -eq 'C:\registered\python.exe') { '3.10.11' } else { '3.14.0' }
+}
+function Get-PythonArchitecture {
+    param([string]`$PythonPath)
+    64
+}
+function Invoke-DownloadWithHashValidation {
+    throw 'SENTINEL-PYTHON-DOWNLOAD-CALLED'
+}
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+`$manifest = Read-BootstrapManifest -Path (Join-Path '$escapedFixture' 'scripts\config\bootstrap-manifest.json')
+Resolve-PythonRuntime -Paths `$paths -Manifest `$manifest
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Equal -Expected 'C:\registered\python.exe' -Actual $result.StdOut.Trim() -Message "Default Python resolution should reuse an exact registered runtime."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Python resolution skips an exact x86 runtime and selects an exact x64 runtime"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+function Get-PythonCommandFromPath {
+    param([switch]`$DisableProbe)
+    'C:\x86\python.exe'
+}
+function Get-PythonCommandsFromRegistry {
+    param([switch]`$DisableProbe)
+    @('C:\x64\python.exe')
+}
+function Get-ExactPythonVersion {
+    param([string]`$PythonPath)
+    '3.10.11'
+}
+function Get-PythonArchitecture {
+    param([string]`$PythonPath)
+    if (`$PythonPath -eq 'C:\x64\python.exe') { 64 } else { 32 }
+}
+function Invoke-DownloadWithHashValidation {
+    throw 'SENTINEL-PYTHON-DOWNLOAD-CALLED'
+}
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+`$manifest = Read-BootstrapManifest -Path (Join-Path '$escapedFixture' 'scripts\config\bootstrap-manifest.json')
+Resolve-PythonRuntime -Paths `$paths -Manifest `$manifest
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Equal -Expected 'C:\x64\python.exe' -Actual $result.StdOut.Trim() -Message "Python resolution should skip an x86 candidate even when its version matches."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Python resolution returns a valid PATH runtime without enumerating broken registry data"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedFixture = $fixture.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+function Get-PythonCommandFromPath {
+    param([switch]`$DisableProbe)
+    'C:\compatible-path\python.exe'
+}
+function Get-PythonCommandsFromRegistry {
+    param([switch]`$DisableProbe)
+    throw 'SENTINEL-BROKEN-PYTHON-REGISTRY'
+}
+function Get-ExactPythonVersion {
+    param([string]`$PythonPath)
+    '3.10.11'
+}
+function Get-PythonArchitecture {
+    param([string]`$PythonPath)
+    64
+}
+`$paths = Resolve-ProjectPaths -RootPath '$escapedFixture'
+`$manifest = Read-BootstrapManifest -Path (Join-Path '$escapedFixture' 'scripts\config\bootstrap-manifest.json')
+Resolve-PythonRuntime -Paths `$paths -Manifest `$manifest
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    Assert-Equal -Expected 'C:\compatible-path\python.exe' -Actual $result.StdOut.Trim() -Message "A valid PATH runtime should short-circuit broken registry discovery."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
+            Name = "Python registry discovery skips a broken entry and keeps later valid entries"
+            Body = {
+                $fixture = New-BootstrapFixture
+                try {
+                    $registeredPython = Join-Path $fixture "registered-python.exe"
+                    Set-Content -LiteralPath $registeredPython -Value "fake-python" -Encoding ASCII
+                    $scriptPath = (Get-BootstrapScriptPath).Replace("'", "''")
+                    $escapedRegisteredPython = $registeredPython.Replace("'", "''")
+                    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$scriptPath'
+`$versionKeyReader = {
+    param(`$RegistryRoot)
+    if (`$RegistryRoot -like '*HKEY_CURRENT_USER*') {
+        return @([pscustomobject]@{ Name = 'broken' }, [pscustomobject]@{ Name = 'valid' })
+    }
+    return @()
+}
+`$installPathReader = {
+    param(`$VersionKey)
+    if (`$VersionKey.Name -eq 'broken') {
+        throw 'SENTINEL-BROKEN-PYTHON-REGISTRY-ENTRY'
+    }
+    return @('$escapedRegisteredPython')
+}
+@(Get-PythonCommandsFromRegistry -RegistryVersionKeyReader `$versionKeyReader -RegistryInstallPathReader `$installPathReader) | ConvertTo-Json -Compress
+"@
+
+                    $result = Invoke-BootstrapChildScript -ScriptContent $childScript -WorkingDirectory $fixture
+                    $paths = @($result.StdOut | ConvertFrom-Json)
+                    Assert-Equal -Expected @($registeredPython) -Actual $paths -Message "A broken registry entry should not hide later valid Python registrations."
+                } finally {
+                    Remove-TempFixture -Path $fixture
+                }
+            }
+        },
+        @{
             Name = "SkipRuntimeDownload rejects node and npm resolved from different directories"
             Body = {
                 $fixture = New-BootstrapFixture

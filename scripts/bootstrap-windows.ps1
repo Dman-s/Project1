@@ -362,6 +362,18 @@ function Get-ExactPythonVersion {
     return $result.StdOut.Trim()
 }
 
+function Get-PythonArchitecture {
+    param([Parameter(Mandatory = $true)][string]$PythonPath)
+
+    $command = "import struct; print(struct.calcsize('P') * 8)"
+    $result = Invoke-CheckedCommand -FilePath $PythonPath -ArgumentList @("-c", $command)
+    $architecture = 0
+    if (-not [int]::TryParse($result.StdOut.Trim(), [ref]$architecture) -or $architecture -notin @(32, 64)) {
+        throw "Python runtime at '$PythonPath' returned an invalid architecture."
+    }
+    return $architecture
+}
+
 function Get-ExactNodeVersion {
     param([Parameter(Mandatory = $true)][string]$NodePath)
 
@@ -601,6 +613,120 @@ function Get-PythonCommandFromPath {
     return $command.Source
 }
 
+function Get-PythonCommandsFromRegistry {
+    param(
+        [switch]$DisableProbe,
+        [scriptblock]$RegistryVersionKeyReader = {
+            param($RegistryRoot)
+            return @(Get-ChildItem -LiteralPath $RegistryRoot -ErrorAction Stop)
+        },
+        [scriptblock]$RegistryInstallPathReader = {
+            param($VersionKey)
+
+            $installPathKey = Join-Path $VersionKey.PSPath "InstallPath"
+            $installItem = Get-Item -LiteralPath $installPathKey -ErrorAction Stop
+            $installProperties = Get-ItemProperty -LiteralPath $installPathKey -ErrorAction Stop
+            $registeredPaths = New-Object System.Collections.Generic.List[string]
+            $executablePathProperty = $installProperties.PSObject.Properties["ExecutablePath"]
+            if ($null -ne $executablePathProperty -and -not [string]::IsNullOrWhiteSpace([string]$executablePathProperty.Value)) {
+                $registeredPaths.Add([string]$executablePathProperty.Value)
+            }
+
+            $installDirectory = [string]$installItem.GetValue("")
+            if (-not [string]::IsNullOrWhiteSpace($installDirectory)) {
+                $registeredPaths.Add((Join-Path $installDirectory "python.exe"))
+            }
+            return @($registeredPaths)
+        }
+    )
+
+    if ($DisableProbe) {
+        return @()
+    }
+
+    $registryRoots = @(
+        "Registry::HKEY_CURRENT_USER\Software\Python\PythonCore",
+        "Registry::HKEY_LOCAL_MACHINE\Software\Python\PythonCore",
+        "Registry::HKEY_LOCAL_MACHINE\Software\WOW6432Node\Python\PythonCore"
+    )
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($registryRoot in $registryRoots) {
+        try {
+            $versionKeys = @(& $RegistryVersionKeyReader $registryRoot)
+        } catch {
+            continue
+        }
+
+        foreach ($versionKey in $versionKeys) {
+            try {
+                $registeredPaths = @(& $RegistryInstallPathReader $versionKey)
+            } catch {
+                continue
+            }
+
+            foreach ($registeredPath in $registeredPaths) {
+                try {
+                    if ((Test-Path -LiteralPath $registeredPath -PathType Leaf -ErrorAction Stop) -and $seen.Add($registeredPath)) {
+                        $candidates.Add($registeredPath)
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+    }
+
+    return @($candidates)
+}
+
+function Find-CompatiblePythonRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+        [switch]$DisableProbe
+    )
+
+    if ($DisableProbe) {
+        return $null
+    }
+
+    $pathPython = Get-PythonCommandFromPath
+    if (-not [string]::IsNullOrWhiteSpace([string]$pathPython)) {
+        try {
+            if (((Get-ExactPythonVersion -PythonPath $pathPython) -eq $ExpectedVersion) -and ((Get-PythonArchitecture -PythonPath $pathPython) -eq 64)) {
+                return [string]$pathPython
+            }
+        } catch {
+        }
+    }
+
+    try {
+        $registeredCandidates = @(Get-PythonCommandsFromRegistry)
+    } catch {
+        $registeredCandidates = @()
+    }
+
+    $seen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in $registeredCandidates) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate)) {
+            continue
+        }
+        if (-not $seen.Add($candidate)) {
+            continue
+        }
+
+        try {
+            if (((Get-ExactPythonVersion -PythonPath $candidate) -eq $ExpectedVersion) -and ((Get-PythonArchitecture -PythonPath $candidate) -eq 64)) {
+                return $candidate
+            }
+        } catch {
+        }
+    }
+
+    return $null
+}
+
 function Get-NodeCommandFromPath {
     param([switch]$DisableProbe)
 
@@ -655,13 +781,13 @@ function Resolve-PythonRuntime {
         }
     }
 
-    if ($SkipDownload) {
-        $pathPython = Get-PythonCommandFromPath -DisableProbe:$DisablePathProbe
-        if ($null -ne $pathPython -and (Get-ExactPythonVersion -PythonPath $pathPython) -eq $expectedVersion) {
-            return $pathPython
-        }
+    $externalPython = Find-CompatiblePythonRuntime -ExpectedVersion $expectedVersion -DisableProbe:$DisablePathProbe
+    if ($null -ne $externalPython) {
+        return $externalPython
+    }
 
-        throw "SkipRuntimeDownload requires a compatible Python $expectedVersion runtime locally or on PATH."
+    if ($SkipDownload) {
+        throw "SkipRuntimeDownload requires a compatible Python $expectedVersion runtime locally, on PATH, or in the CPython registry."
     }
 
     $downloadPaths = New-DownloadPaths -RootPath $Paths.Root -DirectoryPath $Paths.DownloadsRoot -FileName $Manifest.runtime.python.filename -Description "Python runtime download"
