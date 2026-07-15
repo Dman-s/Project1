@@ -44,6 +44,35 @@ class VideoTaskSubmission:
     status: str
 
 
+def build_inference_schedule(
+    total_frames: int,
+    *,
+    sample_rate: int,
+    max_frames: int,
+) -> tuple[int, ...]:
+    if total_frames <= 0:
+        return ()
+    if sample_rate < 1 or max_frames < 0:
+        raise ValueError(
+            "sample_rate must be positive and max_frames non-negative"
+        )
+
+    candidates = list(range(0, total_frames, sample_rate))
+    if candidates[-1] != total_frames - 1:
+        candidates.append(total_frames - 1)
+    if max_frames == 0 or max_frames >= len(candidates):
+        return tuple(candidates)
+    if max_frames == 1:
+        return (total_frames - 1,)
+
+    last = len(candidates) - 1
+    positions = [
+        round(index * last / (max_frames - 1))
+        for index in range(max_frames)
+    ]
+    return tuple(candidates[position] for position in positions)
+
+
 class VideoProgressRegistry:
     """Process-local live state with persisted task fallback after restarts."""
 

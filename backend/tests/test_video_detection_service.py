@@ -14,12 +14,88 @@ from app.services.video_detection_service import (
     VideoProgressRegistry,
     VideoQueueFullError,
     VideoStatusMigrationError,
+    build_inference_schedule,
 )
 from app.services.yolo_detector import (
     DetectedObject,
     ImagePrediction,
     ModelUnavailableError,
 )
+
+
+def test_inference_schedule_covers_full_timeline_when_budget_is_limited():
+    schedule = build_inference_schedule(
+        3394,
+        sample_rate=1,
+        max_frames=50,
+    )
+
+    assert len(schedule) == 50
+    assert schedule[0] == 0
+    assert schedule[-1] == 3393
+    assert all(left < right for left, right in zip(schedule, schedule[1:]))
+
+
+def test_zero_budget_and_unit_stride_select_every_frame():
+    assert build_inference_schedule(
+        6,
+        sample_rate=1,
+        max_frames=0,
+    ) == (0, 1, 2, 3, 4, 5)
+
+
+def test_explicit_stride_still_includes_final_frame():
+    assert build_inference_schedule(
+        8,
+        sample_rate=3,
+        max_frames=0,
+    ) == (0, 3, 6, 7)
+
+
+@pytest.mark.parametrize("total_frames", [0, -1])
+def test_inference_schedule_is_empty_without_source_frames(total_frames):
+    assert build_inference_schedule(
+        total_frames,
+        sample_rate=1,
+        max_frames=0,
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    ("sample_rate", "max_frames"),
+    [(0, 1), (-1, 1), (1, -1)],
+)
+def test_inference_schedule_rejects_invalid_options(sample_rate, max_frames):
+    with pytest.raises(ValueError):
+        build_inference_schedule(
+            10,
+            sample_rate=sample_rate,
+            max_frames=max_frames,
+        )
+
+
+def test_inference_schedule_returns_all_candidates_with_sufficient_budget():
+    assert build_inference_schedule(
+        8,
+        sample_rate=3,
+        max_frames=4,
+    ) == (0, 3, 6, 7)
+
+
+def test_single_frame_budget_selects_final_source_frame():
+    assert build_inference_schedule(
+        8,
+        sample_rate=3,
+        max_frames=1,
+    ) == (7,)
+
+
+def test_inference_schedule_uses_uniform_candidate_positions():
+    assert build_inference_schedule(
+        11,
+        sample_rate=1,
+        max_frames=4,
+    ) == (0, 3, 7, 10)
 
 
 class ImmediateExecutor:

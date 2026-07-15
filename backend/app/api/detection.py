@@ -74,8 +74,11 @@ def _resolve_options(
         raise HTTPException(status_code=400, detail="image_size 必须在 32 到 4096 之间")
     if not 1 <= resolved_rate <= 1000:
         raise HTTPException(status_code=400, detail="sample_rate 必须在 1 到 1000 之间")
-    if not 1 <= resolved_max <= 500:
-        raise HTTPException(status_code=400, detail="max_frames 必须在 1 到 500 之间")
+    if not 0 <= resolved_max <= 100000:
+        raise HTTPException(
+            status_code=400,
+            detail="max_frames 必须在 0 到 100000 之间",
+        )
     return resolved
 
 

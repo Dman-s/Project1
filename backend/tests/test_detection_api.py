@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 from app.api import detection
+from app.config.settings import Settings
 from fastapi.websockets import WebSocketDisconnect
 import pytest
+from pydantic import ValidationError
 from app.services.detection_task_service import TaskNotFoundError
 from app.services.yolo_detector import ModelUnavailableError
 
@@ -39,6 +41,51 @@ class FakeVideoService:
         if task_id != 91:
             raise TaskNotFoundError("missing")
         return self.status
+
+
+def test_video_settings_use_full_timeline_defaults():
+    video_settings = Settings(_env_file=None)
+
+    assert video_settings.VIDEO_FRAME_SAMPLE_RATE == 1
+    assert video_settings.VIDEO_MAX_FRAMES == 0
+    assert video_settings.VIDEO_PREVIEW_INTERVAL_FRAMES == 10
+    assert video_settings.VIDEO_KEY_FRAME_INTERVAL_SECONDS == 1.0
+    assert video_settings.VIDEO_MAX_KEY_FRAMES == 100
+    assert video_settings.VIDEO_BOX_PERSISTENCE_FRAMES == 3
+    assert video_settings.VIDEO_ANNOTATION_FONT_PATH == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("VIDEO_FRAME_SAMPLE_RATE", 0),
+        ("VIDEO_MAX_FRAMES", -1),
+        ("VIDEO_PREVIEW_INTERVAL_FRAMES", 0),
+        ("VIDEO_KEY_FRAME_INTERVAL_SECONDS", -0.1),
+        ("VIDEO_MAX_KEY_FRAMES", 0),
+        ("VIDEO_MAX_KEY_FRAMES", 1001),
+        ("VIDEO_BOX_PERSISTENCE_FRAMES", -1),
+        ("VIDEO_BOX_PERSISTENCE_FRAMES", 31),
+    ],
+)
+def test_video_settings_reject_out_of_range_values(field, value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize("max_frames", [0, 100000])
+def test_video_options_accept_supported_max_frame_bounds(max_frames):
+    resolved = detection._resolve_options(None, None, None, None, max_frames)
+
+    assert resolved[4] == max_frames
+
+
+@pytest.mark.parametrize("max_frames", [-1, 100001])
+def test_video_options_reject_max_frames_outside_bounds(max_frames):
+    with pytest.raises(detection.HTTPException) as raised:
+        detection._resolve_options(None, None, None, None, max_frames)
+
+    assert raised.value.status_code == 400
 
 
 def test_video_upload_requires_authentication(client):
