@@ -118,4 +118,3 @@ describe('VideoDetectionResult', () => {
     expect(html).toContain('92%')
   })
 })
-

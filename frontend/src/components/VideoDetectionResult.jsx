@@ -20,7 +20,6 @@ const STATUS = {
   failed: { label: '检测失败', icon: XCircle, color: 'text-red-400' },
 }
 
-
 function confidenceText(value) {
   const number = Number(value) || 0
   const percentage = number <= 1 ? number * 100 : number
@@ -245,4 +244,3 @@ export function VideoDetectionResult({ data }) {
     </section>
   )
 }
-
