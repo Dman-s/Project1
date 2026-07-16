@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -192,11 +193,30 @@ class FakeRealtimeDetector:
     selected_device = "0"
     class_names = {0: "pl60"}
 
-    def __init__(self, model_path, detections=True, failure=None):
+    def __init__(
+        self,
+        model_path,
+        detections=True,
+        failure=None,
+        class_name="pl60",
+        class_name_sequence=None,
+    ):
         self.model_path = model_path
         self.calls = []
         self.with_detections = detections
         self.failure = failure
+        self.class_name = class_name
+        self.class_name_sequence = tuple(class_name_sequence or ())
+        class_ids = {
+            "pl60": 29,
+            "pl80": 31,
+            "pm55": 34,
+        }
+        self.class_id = class_ids[class_name]
+        self.class_names = {
+            class_ids[name]: name
+            for name in ({class_name} | set(self.class_name_sequence))
+        }
 
     def predict_video_frame(
         self,
@@ -210,6 +230,17 @@ class FakeRealtimeDetector:
         if self.failure is not None:
             raise self.failure
         height, width = frame.shape[:2]
+        call_index = len(self.calls)
+        class_name = (
+            self.class_name_sequence[call_index]
+            if call_index < len(self.class_name_sequence)
+            else self.class_name
+        )
+        class_id = {
+            "pl60": 29,
+            "pl80": 31,
+            "pm55": 34,
+        }[class_name]
         self.calls.append(
             {
                 "frame_index": int(frame[0, 0, 0]),
@@ -225,12 +256,32 @@ class FakeRealtimeDetector:
             inference_time_ms=8.0,
             detections=(
                 DetectedObject(
-                    class_id=29,
-                    class_name="pl60",
+                    class_id=class_id,
+                    class_name=class_name,
                     confidence=0.9,
                     bbox=(1.0, 2.0, 12.0, 14.0),
                 ),
             ) if self.with_detections else (),
+        )
+
+
+class FakeSpeedClassifier:
+    def __init__(self, class_id=2, confidence=0.99):
+        self.class_id = class_id
+        self.confidence = confidence
+        self.calls = []
+
+    def predict(self, image_bytes, *, image_size, **_kwargs):
+        self.calls.append({"image_bytes": image_bytes, "image_size": image_size})
+        return SimpleNamespace(
+            detections=(
+                DetectedObject(
+                    class_id=self.class_id,
+                    class_name="Speed limit (50 km/h)",
+                    confidence=self.confidence,
+                    bbox=(0.0, 0.0, 1.0, 1.0),
+                ),
+            )
         )
 
 
@@ -286,6 +337,8 @@ def build_service(
     failure=None,
     encoder_failure=None,
     progress_registry=None,
+    detected_class_name="pl60",
+    detected_class_names=None,
 ):
     model_path = tmp_path / "best.pt"
     model_path.write_bytes(b"checkpoint")
@@ -293,6 +346,8 @@ def build_service(
         model_path,
         detections=detections,
         failure=failure,
+        class_name=detected_class_name,
+        class_name_sequence=detected_class_names,
     )
     task_service = DetectionTaskService(
         detector=detector,
@@ -390,6 +445,231 @@ def test_video_task_processes_full_timeline_and_returns_playable_media(
     ).read_bytes() == b"fake-mp4"
     assert capture.released is True
     assert list((tmp_path / "videos").glob("**/*")) == []
+
+
+def test_video_task_refines_speed_limit_digits_before_persisting_results(
+    db_session, tmp_path
+):
+    user = create_user(db_session, "video_speed_refinement_user")
+    frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture(frames),
+        detected_class_name="pl80",
+    )
+    classifier = FakeSpeedClassifier(class_id=2, confidence=0.99)
+    service.speed_classifier = classifier
+    service.speed_refinement_enabled = True
+    service.speed_refinement_min_confidence = 0.9
+    service.speed_refinement_padding_ratio = 0.25
+
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="speed-50.mp4",
+        content=b"fake-video",
+        confidence=0.3,
+        iou=0.5,
+        image_size=1280,
+        sample_rate=1,
+        max_frames=0,
+    )
+    db_session.expire_all()
+    status = service.get_status(db_session, user.id, submission.task_id)
+    record = (
+        db_session.query(DetectionResult)
+        .filter(DetectionResult.task_id == submission.task_id)
+        .one()
+    )
+
+    sign = status["key_frames"][0]["traffic_signs"][0]
+    assert sign["class_name"] == "pl50"
+    assert sign["display_name"] == "最高限速 50 km/h"
+    assert record.class_name == "pl50"
+    assert len(classifier.calls) == 1
+    assert classifier.calls[0]["image_size"] == 128
+
+
+@pytest.mark.parametrize(
+    ("source_name", "source_class_id"),
+    [
+        ("pl40", 26),
+        ("pl70", 30),
+        ("pl80", 31),
+        ("pl100", 22),
+        ("pr40", 38),
+    ],
+)
+def test_speed_refinement_corrects_validated_limit_50_confusions(
+    db_session,
+    tmp_path,
+    source_name,
+    source_class_id,
+):
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)]),
+    )
+    service.speed_classifier = FakeSpeedClassifier(
+        class_id=2,
+        confidence=0.99,
+    )
+    service.speed_refinement_enabled = True
+    source = (
+        DetectedObject(
+            class_id=source_class_id,
+            class_name=source_name,
+            confidence=0.57,
+            bbox=(1.0, 2.0, 12.0, 14.0),
+        ),
+    )
+
+    refined = service._refine_speed_limit_detections(
+        np.zeros((24, 32, 3), dtype=np.uint8),
+        source,
+    )
+
+    assert refined[0].class_name == "pl50"
+    assert refined[0].class_id == 28
+    assert refined[0].confidence == source[0].confidence
+
+
+def test_speed_refinement_uses_calibrated_pl40_threshold(
+    db_session, tmp_path
+):
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)]),
+    )
+    service.speed_classifier = FakeSpeedClassifier(
+        class_id=2,
+        confidence=0.755,
+    )
+    service.speed_refinement_enabled = True
+    service.speed_refinement_min_confidence = 0.9
+    service.speed_refinement_pl40_min_confidence = 0.75
+    source = (
+        DetectedObject(
+            class_id=26,
+            class_name="pl40",
+            confidence=0.29,
+            bbox=(1.0, 2.0, 12.0, 14.0),
+        ),
+    )
+
+    refined = service._refine_speed_limit_detections(
+        np.zeros((24, 32, 3), dtype=np.uint8),
+        source,
+    )
+
+    assert refined[0].class_name == "pl50"
+
+
+def test_speed_refinement_preserves_low_confidence_and_non_speed_results(
+    db_session, tmp_path
+):
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)]),
+    )
+    classifier = FakeSpeedClassifier(class_id=2, confidence=0.79)
+    service.speed_classifier = classifier
+    service.speed_refinement_enabled = True
+    service.speed_refinement_min_confidence = 0.8
+    source = (
+        DetectedObject(
+            class_id=31,
+            class_name="pl80",
+            confidence=0.57,
+            bbox=(1.0, 2.0, 12.0, 14.0),
+        ),
+        DetectedObject(
+            class_id=8,
+            class_name="p10",
+            confidence=0.9,
+            bbox=(15.0, 2.0, 25.0, 14.0),
+        ),
+    )
+
+    refined = service._refine_speed_limit_detections(
+        np.zeros((24, 32, 3), dtype=np.uint8),
+        source,
+    )
+
+    assert refined == source
+    assert len(classifier.calls) == 1
+
+
+def test_speed_refinement_does_not_replace_valid_speed_with_another_gtsrb_class(
+    db_session, tmp_path
+):
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture([np.zeros((24, 32, 3), dtype=np.uint8)]),
+    )
+    service.speed_classifier = FakeSpeedClassifier(class_id=5, confidence=0.99)
+    service.speed_refinement_enabled = True
+    source = (
+        DetectedObject(
+            class_id=22,
+            class_name="pl100",
+            confidence=0.82,
+            bbox=(1.0, 2.0, 12.0, 14.0),
+        ),
+    )
+
+    refined = service._refine_speed_limit_detections(
+        np.zeros((24, 32, 3), dtype=np.uint8),
+        source,
+    )
+
+    assert refined == source
+
+
+def test_video_task_propagates_confirmed_limit_50_to_adjacent_weight_confusion(
+    db_session, tmp_path
+):
+    user = create_user(db_session, "video_speed_tracking_user")
+    frames = [
+        np.zeros((24, 32, 3), dtype=np.uint8),
+        np.ones((24, 32, 3), dtype=np.uint8),
+    ]
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture(frames),
+        detected_class_name="pl80",
+        detected_class_names=("pl80", "pm55"),
+    )
+    classifier = FakeSpeedClassifier(class_id=2, confidence=0.99)
+    service.speed_classifier = classifier
+    service.speed_refinement_enabled = True
+    service.speed_refinement_min_confidence = 0.9
+
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="speed-track.mp4",
+        content=b"fake-video",
+        confidence=0.3,
+        iou=0.5,
+        image_size=1280,
+        sample_rate=1,
+        max_frames=0,
+    )
+    db_session.expire_all()
+    status = service.get_status(db_session, user.id, submission.task_id)
+
+    assert [
+        frame["traffic_signs"][0]["class_name"]
+        for frame in status["key_frames"]
+    ] == ["pl50", "pl50"]
+    assert len(classifier.calls) == 1
 
 
 def test_video_task_marks_decode_failure_and_cleans_source(db_session, tmp_path):

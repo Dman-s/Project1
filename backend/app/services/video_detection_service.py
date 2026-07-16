@@ -1,7 +1,7 @@
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import os
@@ -24,10 +24,41 @@ from app.services.detection_task_service import (
     DetectionTaskService,
     detection_task_service,
 )
-from app.services.tt100k_labels import tt100k_label_zh
+from app.services.tt100k_labels import (
+    TT100K_COMMON_45_CLASSES,
+    tt100k_label_zh,
+)
 from app.services.video_encoder import BrowserVideoEncoder, VideoEncodingError
+from app.services.yolo_detector import DetectedObject
 
 logger = get_logger(__name__)
+
+
+GTSRB_SPEED_LIMIT_50_CLASS_ID = 2
+TT100K_SPEED_LIMIT_50_CLASS_ID = TT100K_COMMON_45_CLASSES.index("pl50")
+TT100K_POSSIBLE_SPEED_LIMIT_50_MISCLASSIFICATIONS = frozenset(
+    {"pl40", "pl70", "pl80", "pl100", "pr40"}
+)
+TT100K_SPEED_LIMIT_50_TRACK_CANDIDATES = frozenset(
+    {
+        "pl5",
+        "pl20",
+        "pl30",
+        "pl40",
+        "pl50",
+        "pl60",
+        "pl70",
+        "pl80",
+        "pl100",
+        "pl120",
+        "pm20",
+        "pm30",
+        "pm55",
+        "pr40",
+    }
+)
+SPEED_LIMIT_50_TRACK_TTL_FRAMES = 30
+SPEED_LIMIT_50_TRACK_DISTANCE_RATIO = 4.0
 
 
 class VideoProcessingError(RuntimeError):
@@ -146,6 +177,11 @@ class VideoDetectionService:
         max_key_frames: int | None = None,
         box_persistence_frames: int | None = None,
         annotation_font_path: str | Path | None = None,
+        speed_classifier=None,
+        speed_refinement_enabled: bool | None = None,
+        speed_refinement_min_confidence: float | None = None,
+        speed_refinement_pl40_min_confidence: float | None = None,
+        speed_refinement_padding_ratio: float | None = None,
     ):
         self.task_service = task_service or detection_task_service
         self.detector = detector or self.task_service.detector
@@ -180,6 +216,30 @@ class VideoDetectionService:
             box_persistence_frames
             if box_persistence_frames is not None
             else settings.VIDEO_BOX_PERSISTENCE_FRAMES
+        )
+        router = getattr(self.task_service, "router", None)
+        self.speed_classifier = speed_classifier or getattr(
+            router, "classifier", None
+        )
+        self.speed_refinement_enabled = (
+            settings.VIDEO_SPEED_REFINEMENT_ENABLED
+            if speed_refinement_enabled is None
+            else bool(speed_refinement_enabled)
+        )
+        self.speed_refinement_min_confidence = float(
+            settings.VIDEO_SPEED_REFINEMENT_MIN_CONFIDENCE
+            if speed_refinement_min_confidence is None
+            else speed_refinement_min_confidence
+        )
+        self.speed_refinement_pl40_min_confidence = float(
+            settings.VIDEO_SPEED_REFINEMENT_PL40_MIN_CONFIDENCE
+            if speed_refinement_pl40_min_confidence is None
+            else speed_refinement_pl40_min_confidence
+        )
+        self.speed_refinement_padding_ratio = float(
+            settings.VIDEO_SPEED_REFINEMENT_PADDING_RATIO
+            if speed_refinement_padding_ratio is None
+            else speed_refinement_padding_ratio
         )
         self._annotation_font = self._load_annotation_font(annotation_font_path)
         self.max_pending_tasks = (
@@ -413,6 +473,7 @@ class VideoDetectionService:
             persistence_remaining = 0
             preview_url = None
             preview_version = 0
+            speed_limit_50_tracks: list[dict] = []
 
             while True:
                 readable, frame = capture.read()
@@ -428,6 +489,16 @@ class VideoDetectionService:
                         image_size=image_size,
                         device=self.detector.selected_device,
                     )
+                    refined_detections = self._refine_speed_limit_detections(
+                        frame,
+                        prediction.detections,
+                        speed_limit_50_tracks=speed_limit_50_tracks,
+                    )
+                    if refined_detections != prediction.detections:
+                        prediction = replace(
+                            prediction,
+                            detections=refined_detections,
+                        )
                     inference_frames += 1
                     total_inference_time += prediction.inference_time_ms
                     active_detections = prediction.detections
@@ -667,6 +738,143 @@ class VideoDetectionService:
         if not encoded:
             raise VideoProcessingError("Unable to encode annotated video frame")
         return buffer.tobytes()
+
+    def _refine_speed_limit_detections(
+        self,
+        frame,
+        detections,
+        *,
+        speed_limit_50_tracks: list[dict] | None = None,
+    ):
+        if (
+            not self.speed_refinement_enabled
+            or self.speed_classifier is None
+        ):
+            return detections
+
+        tracks = speed_limit_50_tracks
+        if tracks is not None:
+            for track in tracks:
+                track["age"] += 1
+            tracks[:] = [
+                track
+                for track in tracks
+                if track["age"] <= SPEED_LIMIT_50_TRACK_TTL_FRAMES
+            ]
+        if not detections:
+            return detections
+
+        frame_height, frame_width = frame.shape[:2]
+        refined = []
+        track_updates = []
+        for detection in detections:
+            can_confirm = detection.class_name in (
+                TT100K_POSSIBLE_SPEED_LIMIT_50_MISCLASSIFICATIONS | {"pl50"}
+            )
+            matched_track = (
+                self._match_speed_limit_50_track(detection.bbox, tracks)
+                if tracks is not None
+                and detection.class_name in TT100K_SPEED_LIMIT_50_TRACK_CANDIDATES
+                else None
+            )
+            if not can_confirm and matched_track is None:
+                refined.append(detection)
+                continue
+
+            confirmed = False
+            if can_confirm:
+                x1, y1, x2, y2 = detection.bbox
+                padding = (
+                    max(x2 - x1, y2 - y1)
+                    * self.speed_refinement_padding_ratio
+                )
+                left = max(0, int(x1 - padding))
+                top = max(0, int(y1 - padding))
+                right = min(frame_width, int(x2 + padding + 0.999))
+                bottom = min(frame_height, int(y2 + padding + 0.999))
+                crop = frame[top:bottom, left:right]
+                if crop.size:
+                    try:
+                        classification = self.speed_classifier.predict(
+                            self._encode_jpeg(crop),
+                            image_size=settings.GTSRB_IMAGE_SIZE,
+                        )
+                        classified = classification.detections[0]
+                        minimum_confidence = (
+                            self.speed_refinement_pl40_min_confidence
+                            if detection.class_name == "pl40"
+                            else self.speed_refinement_min_confidence
+                        )
+                        confirmed = (
+                            classified.class_id
+                            == GTSRB_SPEED_LIMIT_50_CLASS_ID
+                            and classified.confidence
+                            >= minimum_confidence
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Unable to refine speed-limit detection %s: %s",
+                            detection.class_name,
+                            exc,
+                        )
+
+            if not confirmed and matched_track is None:
+                refined.append(detection)
+                continue
+            corrected = DetectedObject(
+                class_id=TT100K_SPEED_LIMIT_50_CLASS_ID,
+                class_name="pl50",
+                confidence=detection.confidence,
+                bbox=detection.bbox,
+            )
+            refined.append(corrected)
+            if tracks is not None:
+                track_updates.append((matched_track, corrected.bbox))
+
+        if tracks is not None:
+            for track_index, bbox in track_updates:
+                if track_index is None:
+                    tracks.append({"bbox": bbox, "age": 0})
+                else:
+                    tracks[track_index]["bbox"] = bbox
+                    tracks[track_index]["age"] = 0
+        return tuple(refined)
+
+    @staticmethod
+    def _match_speed_limit_50_track(bbox, tracks) -> int | None:
+        if not tracks:
+            return None
+        x1, y1, x2, y2 = bbox
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        area = width * height
+        best_index = None
+        best_score = None
+        for index, track in enumerate(tracks):
+            tx1, ty1, tx2, ty2 = track["bbox"]
+            track_width = max(1.0, tx2 - tx1)
+            track_height = max(1.0, ty2 - ty1)
+            track_area = track_width * track_height
+            area_ratio = area / track_area
+            if not 0.2 <= area_ratio <= 5.0:
+                continue
+            delta_x = center_x - (tx1 + tx2) / 2
+            delta_y = center_y - (ty1 + ty2) / 2
+            max_distance = SPEED_LIMIT_50_TRACK_DISTANCE_RATIO * max(
+                width,
+                height,
+                track_width,
+                track_height,
+            )
+            score = delta_x * delta_x + delta_y * delta_y
+            if score > max_distance * max_distance:
+                continue
+            if best_score is None or score < best_score:
+                best_index = index
+                best_score = score
+        return best_index
 
     def _should_save_key_frame(
         self,

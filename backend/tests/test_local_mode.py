@@ -63,7 +63,8 @@ def test_local_yolo_settings_resolve_project_paths():
     assert settings.YOLO_DEVICE == "auto"
     assert settings.YOLO_CONFIDENCE == 0.25
     assert settings.YOLO_IOU == 0.45
-    assert settings.YOLO_IMAGE_SIZE == 640
+    assert settings.YOLO_IMAGE_SIZE == 1280
+    assert settings.VIDEO_SPEED_REFINEMENT_PL40_MIN_CONFIDENCE == 0.75
     assert settings.YOLO_MAX_BATCH_IMAGES == 20
     assert settings.YOLO_MAX_IMAGE_BYTES == 10 * 1024 * 1024
     assert settings.gtsrb_model_path.is_absolute()

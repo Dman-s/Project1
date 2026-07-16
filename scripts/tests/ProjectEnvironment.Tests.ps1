@@ -735,6 +735,10 @@ function Get-ProjectEnvironmentTests {
                     Assert-Equal -Expected ($expected + "`r`n") -Actual $content -Message "Local env content mismatch."
                     Assert-Contains -ExpectedSubstring "YOLO_USE_SAHI=true" -Actual $content -Message "Public template must keep SAHI enabled for the default detector."
                     Assert-Contains -ExpectedSubstring "YOLO_MODEL_NAME=tt100k-yolo11s-reference42" -Actual $content -Message "Public template must identify the requested 42-class detector."
+                    Assert-Contains -ExpectedSubstring "YOLO_IMAGE_SIZE=1280" -Actual $content -Message "Video inference must preserve small traffic signs by default."
+                    Assert-Contains -ExpectedSubstring "VIDEO_FRAME_SAMPLE_RATE=1" -Actual $content -Message "Video inference must cover every frame by default."
+                    Assert-Contains -ExpectedSubstring "VIDEO_MAX_FRAMES=0" -Actual $content -Message "Video inference must not truncate the timeline by default."
+                    Assert-Contains -ExpectedSubstring "VIDEO_SPEED_REFINEMENT_PL40_MIN_CONFIDENCE=0.75" -Actual $content -Message "The calibrated pl40-to-pl50 review threshold must be generated."
                     Assert-False -Condition ($content.Contains("should-not-leak")) -Message "Unexpected environment leak."
 
                     $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N") + ".env.example")

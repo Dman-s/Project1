@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     YOLO_SAHI_STANDARD_PREDICTION: bool = True
     YOLO_CONFIDENCE: float = Field(default=0.25, ge=0.0, le=1.0)
     YOLO_IOU: float = Field(default=0.45, ge=0.0, le=1.0)
-    YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
+    YOLO_IMAGE_SIZE: int = Field(default=1280, ge=32)
     YOLO_MAX_BATCH_IMAGES: int = Field(default=20, ge=1)
     YOLO_MAX_IMAGE_BYTES: int = Field(default=10 * 1024 * 1024, ge=1)
     VIDEO_MAX_BYTES: int = Field(default=50 * 1024 * 1024, ge=1)
@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     VIDEO_MAX_KEY_FRAMES: int = Field(default=100, ge=1, le=1000)
     VIDEO_BOX_PERSISTENCE_FRAMES: int = Field(default=3, ge=0, le=30)
     VIDEO_ANNOTATION_FONT_PATH: str = ""
+    VIDEO_SPEED_REFINEMENT_ENABLED: bool = True
+    VIDEO_SPEED_REFINEMENT_MIN_CONFIDENCE: float = Field(
+        default=0.9, ge=0.0, le=1.0
+    )
+    VIDEO_SPEED_REFINEMENT_PL40_MIN_CONFIDENCE: float = Field(
+        default=0.75, ge=0.0, le=1.0
+    )
+    VIDEO_SPEED_REFINEMENT_PADDING_RATIO: float = Field(
+        default=0.25, ge=0.0, le=1.0
+    )
     VIDEO_WORKERS: int = Field(default=2, ge=1, le=8)
     VIDEO_MAX_PENDING_TASKS: int = Field(default=4, ge=1, le=32)
     VIDEO_PROGRESS_TTL_SECONDS: int = Field(default=3600, ge=1)
