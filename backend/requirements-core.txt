@@ -10,6 +10,7 @@ ultralytics==8.3.0
 sahi==0.11.18
 opencv-python==4.9.0.80
 Pillow==12.3.0
+imageio-ffmpeg==0.6.0
 
 # Data layer
 sqlalchemy==2.0.0
