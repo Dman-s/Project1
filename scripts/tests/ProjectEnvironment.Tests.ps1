@@ -765,6 +765,45 @@ function Get-ProjectEnvironmentTests {
             }
         },
         @{
+            Name = "Dependency guide stays aligned with repository manifests"
+            Body = {
+                $manifest = Read-BootstrapManifest -Path $ManifestPath
+                $resolvedModulePath = (Resolve-Path -LiteralPath $ModulePath).Path
+                $projectRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $resolvedModulePath))
+                $guidePath = Join-Path $projectRoot "docs\dependencies.md"
+                Assert-True -Condition (Test-Path -LiteralPath $guidePath -PathType Leaf) -Message "Dependency guide is missing."
+                $content = [System.IO.File]::ReadAllText($guidePath, [System.Text.Encoding]::UTF8)
+
+                Assert-Contains -ExpectedSubstring ([string]$manifest.runtime.python.version) -Actual $content -Message "Python runtime version is missing from the dependency guide."
+                Assert-Contains -ExpectedSubstring ([string]$manifest.runtime.node.version) -Actual $content -Message "Node runtime version is missing from the dependency guide."
+                foreach ($model in @($manifest.release.models)) {
+                    Assert-Contains -ExpectedSubstring ([string]$model.filename) -Actual $content -Message "Model filename is missing from the dependency guide."
+                    Assert-Contains -ExpectedSubstring ([string]$model.bytes) -Actual $content -Message "Model size is missing from the dependency guide."
+                    Assert-Contains -ExpectedSubstring ([string]$model.sha256) -Actual $content -Message "Model hash is missing from the dependency guide."
+                }
+
+                foreach ($requiredText in @(
+                    "requirements-cpu.txt",
+                    "requirements-gpu.txt",
+                    "requirements-common.lock",
+                    "package-lock.json",
+                    "torch==2.11.0+cpu",
+                    "torch==2.11.0+cu128",
+                    "CUDA 12.8",
+                    "SQLite",
+                    "PostgreSQL",
+                    "Redis",
+                    "MinIO",
+                    "system FFmpeg",
+                    "CUDA Toolkit",
+                    "WSL",
+                    "Docker"
+                )) {
+                    Assert-Contains -ExpectedSubstring $requiredText -Actual $content -Message ("Dependency guide is missing: " + $requiredText)
+                }
+            }
+        },
+        @{
             Name = "Repository manifest publishes only the requested 42-class detector"
             Body = {
                 $manifest = Read-BootstrapManifest -Path $ManifestPath

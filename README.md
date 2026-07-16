@@ -119,6 +119,7 @@ GitHub Actions 会在 Windows 和 Linux 上执行对应的后端、前端和 boo
 
 ## 文档
 
+- [完整依赖与运行模式说明](docs/dependencies.md)
 - [Windows 安装与故障排查](docs/windows-setup.md)
 - [本地开发、识别、训练与评估](docs/local-development.md)
 - [TT100K reference42 类别与中文含义](docs/tt100k-reference42.md)
