@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -11,6 +12,8 @@ from threading import BoundedSemaphore, RLock
 from time import monotonic
 
 import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy.orm import Session
 
 from app.config.settings import settings
@@ -22,6 +25,7 @@ from app.services.detection_task_service import (
     detection_task_service,
 )
 from app.services.tt100k_labels import tt100k_label_zh
+from app.services.video_encoder import BrowserVideoEncoder, VideoEncodingError
 
 logger = get_logger(__name__)
 
@@ -42,6 +46,13 @@ class VideoStatusMigrationError(RuntimeError):
 class VideoTaskSubmission:
     task_id: int
     status: str
+
+
+@dataclass(frozen=True)
+class VideoOutputPaths:
+    task_dir: Path
+    preview_path: Path
+    video_path: Path
 
 
 def build_inference_schedule(
@@ -129,6 +140,12 @@ class VideoDetectionService:
         executor=None,
         progress_registry: VideoProgressRegistry | None = None,
         max_pending_tasks: int | None = None,
+        encoder_factory=None,
+        preview_interval_frames: int | None = None,
+        key_frame_interval_seconds: float | None = None,
+        max_key_frames: int | None = None,
+        box_persistence_frames: int | None = None,
+        annotation_font_path: str | Path | None = None,
     ):
         self.task_service = task_service or detection_task_service
         self.detector = detector or self.task_service.detector
@@ -143,6 +160,28 @@ class VideoDetectionService:
             thread_name_prefix="video-detection",
         )
         self.progress = progress_registry or VideoProgressRegistry()
+        self.encoder_factory = encoder_factory or BrowserVideoEncoder
+        self.preview_interval_frames = int(
+            preview_interval_frames
+            if preview_interval_frames is not None
+            else settings.VIDEO_PREVIEW_INTERVAL_FRAMES
+        )
+        self.key_frame_interval_seconds = float(
+            key_frame_interval_seconds
+            if key_frame_interval_seconds is not None
+            else settings.VIDEO_KEY_FRAME_INTERVAL_SECONDS
+        )
+        self.max_key_frames = int(
+            max_key_frames
+            if max_key_frames is not None
+            else settings.VIDEO_MAX_KEY_FRAMES
+        )
+        self.box_persistence_frames = int(
+            box_persistence_frames
+            if box_persistence_frames is not None
+            else settings.VIDEO_BOX_PERSISTENCE_FRAMES
+        )
+        self._annotation_font = self._load_annotation_font(annotation_font_path)
         self.max_pending_tasks = (
             max_pending_tasks or settings.VIDEO_MAX_PENDING_TASKS
         )
@@ -163,8 +202,10 @@ class VideoDetectionService:
         sample_rate: int,
         max_frames: int,
     ) -> VideoTaskSubmission:
-        if sample_rate < 1 or max_frames < 1:
-            raise ValueError("sample_rate and max_frames must be positive")
+        if sample_rate < 1 or max_frames < 0:
+            raise ValueError(
+                "sample_rate must be positive and max_frames non-negative"
+            )
         if not self._admission.acquire(blocking=False):
             raise VideoQueueFullError("视频检测队列已满，请稍后重试")
 
@@ -208,10 +249,13 @@ class VideoDetectionService:
             initial_state = {
                 "task_id": task_id,
                 "status": "pending",
+                "stage": "pending",
                 "progress": 0,
                 "filename": safe_filename,
                 "processed_frames": 0,
                 "sampled_frames": 0,
+                "inference_frames": 0,
+                "detected_frames": 0,
                 "total_objects": 0,
                 "total_inference_time": 0.0,
                 "average_inference_time": 0.0,
@@ -224,6 +268,10 @@ class VideoDetectionService:
                     "height": 0,
                 },
                 "key_frames": [],
+                "preview_frame_url": None,
+                "preview_version": 0,
+                "annotated_video_url": None,
+                "download_url": None,
                 "error": None,
             }
             self.progress.create(task_id, initial_state)
@@ -306,6 +354,8 @@ class VideoDetectionService:
         max_frames: int,
     ) -> None:
         capture = None
+        encoder = None
+        paths = self._output_paths(task_id, filename)
         db = self.session_factory()
         try:
             task = db.get(DetectionTask, task_id)
@@ -313,7 +363,11 @@ class VideoDetectionService:
                 raise VideoProcessingError(f"Detection task {task_id} was not found")
             task.status = "processing"
             db.commit()
-            self.progress.update(task_id, status="processing")
+            self.progress.update(
+                task_id,
+                status="processing",
+                stage="detecting",
+            )
 
             capture = self.capture_factory(str(source_path))
             if not capture.isOpened():
@@ -334,99 +388,146 @@ class VideoDetectionService:
             }
             self.progress.update(task_id, metadata=metadata)
 
+            paths.task_dir.mkdir(parents=True, exist_ok=True)
+            encoder = self.encoder_factory(
+                output_path=paths.video_path,
+                width=width,
+                height=height,
+                fps=fps,
+            )
+            encoder.open()
+
             frame_index = 0
             processed_frames = 0
-            sampled_frames = 0
+            inference_frames = 0
+            detected_frames = 0
             total_objects = 0
             total_inference_time = 0.0
             key_frames: list[dict] = []
-            planned_source_frames = self._planned_source_frames(
+            inference_schedule = set(build_inference_schedule(
                 total_frames,
-                sample_rate,
-                max_frames,
-            )
+                sample_rate=sample_rate,
+                max_frames=max_frames,
+            ))
+            active_detections = ()
+            persistence_remaining = 0
+            preview_url = None
+            preview_version = 0
 
-            while sampled_frames < max_frames:
+            while True:
                 readable, frame = capture.read()
                 if not readable:
                     break
                 processed_frames += 1
-                if frame_index % sample_rate != 0:
-                    frame_index += 1
-                    self._update_running_progress(
-                        task_id,
-                        processed_frames,
-                        sampled_frames,
-                        planned_source_frames,
-                        total_objects,
-                        total_inference_time,
-                        key_frames,
+                prediction = None
+                if frame_index in inference_schedule:
+                    prediction = self.detector.predict_video_frame(
+                        frame,
+                        confidence=confidence,
+                        iou=iou,
+                        image_size=image_size,
+                        device=self.detector.selected_device,
                     )
-                    continue
+                    inference_frames += 1
+                    total_inference_time += prediction.inference_time_ms
+                    active_detections = prediction.detections
+                    if active_detections:
+                        detected_frames += 1
+                        total_objects += len(active_detections)
+                        persistence_remaining = self.box_persistence_frames
+                    else:
+                        persistence_remaining = 0
+                elif persistence_remaining > 0:
+                    persistence_remaining -= 1
+                else:
+                    active_detections = ()
 
-                encoded, jpeg = cv2.imencode(".jpg", frame)
-                if not encoded:
-                    raise VideoProcessingError(
-                        f"Unable to encode frame {frame_index} from {filename}"
+                annotated = self._annotate_frame(frame, active_detections)
+                encoder.write(annotated)
+
+                timestamp = round(frame_index / fps, 3)
+                if (
+                    prediction is not None
+                    and prediction.detections
+                    and self._should_save_key_frame(timestamp, key_frames)
+                ):
+                    annotation_name = (
+                        f"{Path(filename).stem}_frame_{frame_index:06d}.jpg"
                     )
-                prediction = self.detector.predict_realtime(
-                    jpeg.tobytes(),
-                    confidence=confidence,
-                    iou=iou,
-                    image_size=image_size,
-                    device=self.detector.selected_device,
+                    annotated_url = self.task_service._save_annotation(
+                        task_id,
+                        len(key_frames),
+                        annotation_name,
+                        self._encode_jpeg(annotated),
+                    )
+                    serialized = self.task_service._serialize_signs(
+                        task_id,
+                        f"{filename}#frame={frame_index}",
+                        annotated_url,
+                        prediction,
+                    )
+                    db.add_all(serialized["records"])
+                    key_frames.append(
+                        {
+                            "frame_index": frame_index,
+                            "timestamp": timestamp,
+                            "annotated_image_url": annotated_url,
+                            "traffic_signs": serialized["items"],
+                            "image_width": prediction.width,
+                            "image_height": prediction.height,
+                            "inference_time": prediction.inference_time_ms,
+                        }
+                    )
+                    task.total_images = inference_frames
+                    task.total_objects = total_objects
+                    task.total_inference_time = total_inference_time
+                    db.commit()
+
+                publish_preview = (
+                    frame_index % self.preview_interval_frames == 0
+                    or frame_index == total_frames - 1
                 )
-                image_path = f"{filename}#frame={frame_index}"
-                annotation_name = (
-                    f"{Path(filename).stem}_frame_{frame_index:06d}.jpg"
-                )
-                annotated_url = self.task_service._save_annotation(
-                    task_id,
-                    sampled_frames,
-                    annotation_name,
-                    prediction.annotated_jpeg,
-                )
-                serialized = self.task_service._serialize_signs(
-                    task_id,
-                    image_path,
-                    annotated_url,
-                    prediction,
-                )
-                db.add_all(serialized["records"])
-                sampled_frames += 1
-                total_objects += len(serialized["items"])
-                total_inference_time += prediction.inference_time_ms
-                key_frames.append(
-                    {
-                        "frame_index": frame_index,
-                        "timestamp": round(frame_index / fps, 3) if fps > 0 else 0.0,
-                        "annotated_image_url": annotated_url,
-                        "traffic_signs": serialized["items"],
-                        "image_width": prediction.width,
-                        "image_height": prediction.height,
-                        "inference_time": prediction.inference_time_ms,
-                    }
-                )
-                task.total_images = sampled_frames
-                task.total_objects = total_objects
-                task.total_inference_time = total_inference_time
-                db.commit()
+                if publish_preview:
+                    preview_url, preview_version = self._publish_preview(
+                        paths,
+                        annotated,
+                        frame_index,
+                    )
                 self._update_running_progress(
-                    task_id,
-                    processed_frames,
-                    sampled_frames,
-                    planned_source_frames,
-                    total_objects,
-                    total_inference_time,
-                    key_frames,
+                    task_id=task_id,
+                    processed_frames=processed_frames,
+                    inference_frames=inference_frames,
+                    total_frames=total_frames,
+                    detected_frames=detected_frames,
+                    total_objects=total_objects,
+                    total_inference_time=total_inference_time,
+                    key_frames=key_frames,
+                    preview_frame_url=preview_url,
+                    preview_version=preview_version,
                 )
                 frame_index += 1
 
-            if sampled_frames == 0:
+            if processed_frames == 0:
                 raise VideoProcessingError(f"Video contains no readable frames: {filename}")
 
+            if preview_version != frame_index - 1:
+                preview_url, preview_version = self._publish_preview(
+                    paths,
+                    annotated,
+                    frame_index - 1,
+                )
+            self.progress.update(
+                task_id,
+                stage="finalizing",
+                progress=96,
+                preview_frame_url=preview_url,
+                preview_version=preview_version,
+            )
+            final_path = encoder.close()
+            annotated_video_url = self._public_upload_url(final_path)
+
             task.status = "completed"
-            task.total_images = sampled_frames
+            task.total_images = inference_frames
             task.total_objects = total_objects
             task.total_inference_time = total_inference_time
             task.completed_at = datetime.now()
@@ -434,29 +535,55 @@ class VideoDetectionService:
             self.progress.update(
                 task_id,
                 status="completed",
+                stage="completed",
                 progress=100,
                 processed_frames=processed_frames,
-                sampled_frames=sampled_frames,
+                sampled_frames=inference_frames,
+                inference_frames=inference_frames,
+                detected_frames=detected_frames,
                 total_objects=total_objects,
                 total_inference_time=total_inference_time,
-                average_inference_time=total_inference_time / sampled_frames,
+                average_inference_time=(
+                    total_inference_time / inference_frames
+                    if inference_frames
+                    else 0.0
+                ),
                 key_frames=key_frames,
+                preview_frame_url=preview_url,
+                preview_version=preview_version,
+                annotated_video_url=annotated_video_url,
+                download_url=annotated_video_url,
             )
             self._persist_terminal_state_safely(task_id)
         except Exception as exc:
             db.rollback()
+            if encoder is not None:
+                try:
+                    encoder.abort()
+                except Exception:
+                    logger.exception("Unable to abort video encoder for task %s", task_id)
+            shutil.rmtree(paths.task_dir, ignore_errors=True)
             public_error = self._public_error(exc)
             task = db.get(DetectionTask, task_id)
             if task is not None:
+                for result in list(task.results):
+                    db.delete(result)
                 task.status = "failed"
                 task.error_message = public_error
+                task.total_images = 0
+                task.total_objects = 0
+                task.total_inference_time = 0.0
                 task.completed_at = datetime.now()
                 db.commit()
             logger.exception("Video detection task %s failed", task_id)
             self.progress.update(
                 task_id,
                 status="failed",
+                stage="failed",
                 progress=100,
+                preview_frame_url=None,
+                annotated_video_url=None,
+                download_url=None,
                 error=public_error,
             )
             self._persist_terminal_state_safely(task_id)
@@ -468,31 +595,162 @@ class VideoDetectionService:
 
     def _update_running_progress(
         self,
+        *,
         task_id: int,
         processed_frames: int,
-        sampled_frames: int,
-        progress_total_frames: int,
+        inference_frames: int,
+        total_frames: int,
+        detected_frames: int,
         total_objects: int,
         total_inference_time: float,
         key_frames: list[dict],
+        preview_frame_url: str | None,
+        preview_version: int,
     ) -> None:
         progress = (
-            min(99, round(processed_frames / progress_total_frames * 100))
-            if progress_total_frames > 0
+            min(95, max(1, round(processed_frames / total_frames * 95)))
+            if total_frames > 0
             else 0
         )
         self.progress.update(
             task_id,
+            stage="detecting",
             progress=progress,
             processed_frames=processed_frames,
-            sampled_frames=sampled_frames,
+            sampled_frames=inference_frames,
+            inference_frames=inference_frames,
+            detected_frames=detected_frames,
             total_objects=total_objects,
             total_inference_time=total_inference_time,
             average_inference_time=(
-                total_inference_time / sampled_frames if sampled_frames else 0.0
+                total_inference_time / inference_frames
+                if inference_frames
+                else 0.0
             ),
             key_frames=key_frames,
+            preview_frame_url=preview_frame_url,
+            preview_version=preview_version,
         )
+
+    def _output_paths(self, task_id: int, filename: str) -> VideoOutputPaths:
+        task_dir = self.output_dir / str(task_id)
+        stem = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "_",
+            Path(filename).stem,
+        ).strip("._") or "video"
+        return VideoOutputPaths(
+            task_dir=task_dir,
+            preview_path=task_dir / "preview.jpg",
+            video_path=task_dir / f"{stem}_annotated.mp4",
+        )
+
+    def _publish_preview(
+        self,
+        paths: VideoOutputPaths,
+        frame: np.ndarray,
+        frame_index: int,
+    ) -> tuple[str, int]:
+        paths.task_dir.mkdir(parents=True, exist_ok=True)
+        temporary = paths.task_dir / "preview.tmp.jpg"
+        temporary.write_bytes(self._encode_jpeg(frame))
+        temporary.replace(paths.preview_path)
+        return self._public_upload_url(paths.preview_path), frame_index
+
+    def _public_upload_url(self, path: Path) -> str:
+        relative = path.resolve().relative_to(self.output_dir.resolve())
+        return "/uploads/detections/" + relative.as_posix()
+
+    @staticmethod
+    def _encode_jpeg(frame: np.ndarray) -> bytes:
+        encoded, buffer = cv2.imencode(".jpg", frame)
+        if not encoded:
+            raise VideoProcessingError("Unable to encode annotated video frame")
+        return buffer.tobytes()
+
+    def _should_save_key_frame(
+        self,
+        timestamp: float,
+        key_frames: list[dict],
+    ) -> bool:
+        if len(key_frames) >= self.max_key_frames:
+            return False
+        if not key_frames:
+            return True
+        return (
+            timestamp - key_frames[-1]["timestamp"]
+            >= self.key_frame_interval_seconds
+        )
+
+    @staticmethod
+    def _load_annotation_font(configured_path: str | Path | None):
+        configured = str(
+            configured_path
+            if configured_path is not None
+            else settings.VIDEO_ANNOTATION_FONT_PATH
+        ).strip()
+        windows_dir = Path(os.environ.get("WINDIR", "C:/Windows"))
+        candidates = ([Path(configured)] if configured else []) + [
+            windows_dir / "Fonts" / "msyh.ttc",
+            windows_dir / "Fonts" / "simhei.ttf",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    return ImageFont.truetype(str(candidate), size=22)
+                except OSError:
+                    continue
+        return ImageFont.load_default()
+
+    def _annotate_frame(self, frame: np.ndarray, detections) -> np.ndarray:
+        canvas = frame.copy()
+        if not detections:
+            return canvas
+        labels = []
+        height, width = canvas.shape[:2]
+        for detection in detections:
+            x1, y1, x2, y2 = (round(value) for value in detection.bbox)
+            x1 = min(max(0, x1), width - 1)
+            x2 = min(max(0, x2), width - 1)
+            y1 = min(max(0, y1), height - 1)
+            y2 = min(max(0, y2), height - 1)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 210, 40), 2)
+            display_name = (
+                tt100k_label_zh(detection.class_name)
+                or detection.class_name
+            )
+            labels.append(
+                (
+                    x1,
+                    y1,
+                    f"{display_name} ({detection.class_name}) "
+                    f"{detection.confidence:.0%}",
+                )
+            )
+
+        image = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(image)
+        for x, y, label in labels:
+            left, top, right, bottom = draw.textbbox(
+                (0, 0),
+                label,
+                font=self._annotation_font,
+            )
+            text_width = right - left
+            text_height = bottom - top
+            text_top = max(0, y - text_height - 8)
+            text_right = min(width - 1, x + text_width + 8)
+            draw.rectangle(
+                (x, text_top, text_right, text_top + text_height + 8),
+                fill=(0, 210, 40),
+            )
+            draw.text(
+                (x + 4, text_top + 4),
+                label,
+                font=self._annotation_font,
+                fill=(0, 0, 0),
+            )
+        return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
     def get_status(self, db: Session, user_id: int, task_id: int) -> dict:
         task = self.task_service.get_task(db, user_id, task_id)
@@ -580,18 +838,11 @@ class VideoDetectionService:
         return migrated
 
     @staticmethod
-    def _planned_source_frames(
-        total_frames: int,
-        sample_rate: int,
-        max_frames: int,
-    ) -> int:
-        sample_window = 1 + (max_frames - 1) * sample_rate
-        return min(total_frames, sample_window)
-
-    @staticmethod
     def _public_error(exc: Exception) -> str:
         if isinstance(exc, VideoProcessingError):
             return str(exc)
+        if isinstance(exc, VideoEncodingError):
+            return "无法生成可播放视频，请查看服务日志"
         return "视频检测失败，请查看服务日志"
 
     def _persisted_status(self, task: DetectionTask) -> dict:
@@ -632,13 +883,35 @@ class VideoDetectionService:
             )
         sampled = task.total_images or len(grouped)
         total_time = task.total_inference_time or 0.0
+        task_dir = self.output_dir / str(task.id)
+        preview_path = task_dir / "preview.jpg"
+        video_paths = sorted(task_dir.glob("*_annotated.mp4"))
+        preview_url = (
+            self._public_upload_url(preview_path)
+            if preview_path.is_file()
+            else None
+        )
+        annotated_video_url = (
+            self._public_upload_url(video_paths[0])
+            if video_paths
+            else None
+        )
         return {
             "task_id": task.id,
             "status": task.status,
+            "stage": (
+                "completed"
+                if task.status == "completed"
+                else "failed"
+                if task.status == "failed"
+                else "pending"
+            ),
             "progress": 100 if task.status in {"completed", "failed"} else 0,
             "filename": None,
             "processed_frames": sampled,
             "sampled_frames": sampled,
+            "inference_frames": sampled,
+            "detected_frames": len(grouped),
             "total_objects": task.total_objects or 0,
             "total_inference_time": total_time,
             "average_inference_time": total_time / sampled if sampled else 0.0,
@@ -651,6 +924,13 @@ class VideoDetectionService:
                 "height": 0,
             },
             "key_frames": list(grouped.values()),
+            "preview_frame_url": preview_url,
+            "preview_version": max(
+                (frame["frame_index"] for frame in grouped.values()),
+                default=0,
+            ),
+            "annotated_video_url": annotated_video_url,
+            "download_url": annotated_video_url,
             "error": task.error_message,
         }
 

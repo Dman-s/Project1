@@ -1,9 +1,7 @@
 from concurrent.futures import Future
-from io import BytesIO
 
 import cv2
 import numpy as np
-from PIL import Image
 import pytest
 from sqlalchemy.orm import sessionmaker
 
@@ -18,8 +16,8 @@ from app.services.video_detection_service import (
 )
 from app.services.yolo_detector import (
     DetectedObject,
-    ImagePrediction,
     ModelUnavailableError,
+    VideoFramePrediction,
 )
 
 
@@ -200,20 +198,28 @@ class FakeRealtimeDetector:
         self.with_detections = detections
         self.failure = failure
 
-    def predict_realtime(self, image_bytes, confidence, iou, image_size, device=None):
+    def predict_video_frame(
+        self,
+        frame,
+        *,
+        confidence,
+        iou,
+        image_size,
+        device=None,
+    ):
         if self.failure is not None:
             raise self.failure
-        with Image.open(BytesIO(image_bytes)) as image:
-            width, height = image.size
+        height, width = frame.shape[:2]
         self.calls.append(
             {
+                "frame_index": int(frame[0, 0, 0]),
                 "confidence": confidence,
                 "iou": iou,
                 "image_size": image_size,
                 "device": device,
             }
         )
-        return ImagePrediction(
+        return VideoFramePrediction(
             width=width,
             height=height,
             inference_time_ms=8.0,
@@ -225,8 +231,36 @@ class FakeRealtimeDetector:
                     bbox=(1.0, 2.0, 12.0, 14.0),
                 ),
             ) if self.with_detections else (),
-            annotated_jpeg=b"annotated-frame",
         )
+
+
+class FakeVideoEncoder:
+    def __init__(self, *, output_path, width, height, fps, failure=None):
+        self.output_path = output_path
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.failure = failure
+        self.frames = []
+        self.opened = False
+        self.aborted = False
+
+    def open(self):
+        self.opened = True
+
+    def write(self, frame):
+        self.frames.append(frame.copy())
+
+    def close(self):
+        if self.failure is not None:
+            raise self.failure
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_bytes(b"fake-mp4")
+        return self.output_path
+
+    def abort(self):
+        self.aborted = True
+        self.output_path.unlink(missing_ok=True)
 
 
 def create_user(db_session, username):
@@ -250,6 +284,7 @@ def build_service(
     max_pending_tasks=None,
     detections=True,
     failure=None,
+    encoder_failure=None,
     progress_registry=None,
 ):
     model_path = tmp_path / "best.pt"
@@ -263,6 +298,13 @@ def build_service(
         detector=detector,
         output_dir=tmp_path / "detections",
     )
+    encoders = []
+
+    def encoder_factory(**options):
+        encoder = FakeVideoEncoder(**options, failure=encoder_failure)
+        encoders.append(encoder)
+        return encoder
+
     worker_sessions = sessionmaker(bind=db_session.get_bind())
     service = VideoDetectionService(
         detector=detector,
@@ -275,11 +317,15 @@ def build_service(
         executor=executor or ImmediateExecutor(),
         max_pending_tasks=max_pending_tasks,
         progress_registry=progress_registry,
+        encoder_factory=encoder_factory,
+        preview_interval_frames=2,
+        key_frame_interval_seconds=0,
     )
+    service.fake_encoders = encoders
     return service, detector
 
 
-def test_video_task_samples_frames_persists_results_and_cleans_source(
+def test_video_task_processes_full_timeline_and_returns_playable_media(
     db_session, tmp_path
 ):
     user = create_user(db_session, "video_service_user")
@@ -309,8 +355,13 @@ def test_video_task_samples_frames_persists_results_and_cleans_source(
 
     assert status["status"] == "completed"
     assert status["progress"] == 100
+    assert status["stage"] == "completed"
+    assert status["processed_frames"] == 6
+    assert status["inference_frames"] == 3
     assert status["sampled_frames"] == 3
-    assert [frame["frame_index"] for frame in status["key_frames"]] == [0, 2, 4]
+    assert status["detected_frames"] == 3
+    assert [call["frame_index"] for call in detector.calls] == [0, 4, 5]
+    assert [frame["frame_index"] for frame in status["key_frames"]] == [0, 4, 5]
     assert status["key_frames"][0]["traffic_signs"][0]["display_name"] == "最高限速 60 km/h"
     assert status["metadata"] == {
         "total_frames": 6,
@@ -325,6 +376,18 @@ def test_video_task_samples_frames_persists_results_and_cleans_source(
     assert len(records) == 3
     assert records[0].image_path == "road.mp4#frame=0"
     assert all(call["device"] == "0" for call in detector.calls)
+    assert len(service.fake_encoders) == 1
+    assert len(service.fake_encoders[0].frames) == 6
+    assert status["preview_frame_url"].endswith("/preview.jpg")
+    assert status["preview_version"] == 5
+    assert status["annotated_video_url"].endswith("/road_annotated.mp4")
+    assert status["download_url"] == status["annotated_video_url"]
+    assert (
+        tmp_path / "detections" / str(submission.task_id) / "preview.jpg"
+    ).is_file()
+    assert (
+        tmp_path / "detections" / str(submission.task_id) / "road_annotated.mp4"
+    ).read_bytes() == b"fake-mp4"
     assert capture.released is True
     assert list((tmp_path / "videos").glob("**/*")) == []
 
@@ -466,8 +529,10 @@ def test_terminal_progress_expires_and_reloads_complete_sidecar(
 
     assert reloaded["filename"] == "empty.mp4"
     assert reloaded["metadata"]["fps"] == 10.0
-    assert len(reloaded["key_frames"]) == 1
-    assert reloaded["key_frames"][0]["traffic_signs"] == []
+    assert reloaded["stage"] == "completed"
+    assert reloaded["inference_frames"] == 1
+    assert reloaded["key_frames"] == []
+    assert reloaded["annotated_video_url"].endswith("/empty_annotated.mp4")
     assert (tmp_path / "video-status" / f"{submission.task_id}.json").is_file()
     assert not (
         tmp_path
@@ -505,12 +570,76 @@ def test_worker_hides_detector_filesystem_errors(db_session, tmp_path):
     assert "D:/secret" not in status["error"]
 
 
-def test_progress_uses_planned_sample_window_when_max_frames_truncates_video():
-    assert VideoDetectionService._planned_source_frames(
-        total_frames=1000,
-        sample_rate=5,
-        max_frames=2,
-    ) == 6
+def test_video_encoder_failure_marks_task_failed_and_cleans_partial_outputs(
+    db_session,
+    tmp_path,
+):
+    user = create_user(db_session, "video_encoder_failure_user")
+    frames = [np.full((24, 32, 3), value, dtype=np.uint8) for value in range(3)]
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture(frames),
+        encoder_failure=RuntimeError("ffmpeg failed"),
+    )
+
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="road.mp4",
+        content=b"video",
+        confidence=0.25,
+        iou=0.45,
+        image_size=640,
+        sample_rate=1,
+        max_frames=0,
+    )
+    status = service.get_status(db_session, user.id, submission.task_id)
+
+    assert status["status"] == "failed"
+    assert status["stage"] == "failed"
+    assert service.fake_encoders[0].aborted is True
+    assert not (tmp_path / "detections" / str(submission.task_id)).exists()
+    assert (
+        db_session.query(DetectionResult)
+        .filter(DetectionResult.task_id == submission.task_id)
+        .count()
+        == 0
+    )
+
+
+def test_database_fallback_exposes_new_video_status_fields(db_session, tmp_path):
+    user = create_user(db_session, "video_database_fallback_user")
+    frames = [np.full((24, 32, 3), value, dtype=np.uint8) for value in range(2)]
+    service, _detector = build_service(
+        db_session,
+        tmp_path,
+        FakeCapture(frames),
+    )
+    submission = service.submit(
+        db=db_session,
+        user_id=user.id,
+        filename="fallback.mp4",
+        content=b"video",
+        confidence=0.25,
+        iou=0.45,
+        image_size=640,
+        sample_rate=1,
+        max_frames=0,
+    )
+    db_session.expire_all()
+    task = db_session.get(DetectionTask, submission.task_id)
+
+    fallback = service._persisted_status(task)
+
+    assert fallback["stage"] == "completed"
+    assert fallback["inference_frames"] == 2
+    assert fallback["detected_frames"] == 2
+    assert fallback["preview_frame_url"].endswith("/preview.jpg")
+    assert fallback["annotated_video_url"].endswith(
+        "/fallback_annotated.mp4"
+    )
+    assert fallback["download_url"] == fallback["annotated_video_url"]
 
 
 def test_executor_submission_failure_marks_task_failed_and_cleans_files(
