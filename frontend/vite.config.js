@@ -39,7 +39,6 @@ export default defineConfig({
         target: "http://localhost:8000",
         changeOrigin: true,
         ws: true,
-        rewrite: (path) => path.replace(/^\/api\/chat-sessions/, "/chat-sessions"),
       },
       "/uploads": {
         target: "http://localhost:8000",

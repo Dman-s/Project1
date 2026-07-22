@@ -39,14 +39,17 @@ class SchedulerService:
 
     def _clear_file_cache_daily(self):
         """每天0:00清理文件缓存表"""
+        db_dependency = get_db()
         try:
-            db = next(get_db())
+            db = next(db_dependency)
             deleted_count = file_cache_service.clear_all(db)
             logger.info(f"每日文件缓存清理完成，删除 {deleted_count} 条记录")
             print(f"[{datetime.now()}] 每日文件缓存清理完成，删除 {deleted_count} 条记录")
         except Exception as e:
             logger.error(f"每日文件缓存清理失败: {e}")
             print(f"[{datetime.now()}] 每日文件缓存清理失败: {e}")
+        finally:
+            db_dependency.close()
 
     def start(self):
         """启动定时任务调度器"""

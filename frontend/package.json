@@ -35,7 +35,6 @@
     "tailwindcss": "^3.4.19",
     "vite": "^6.3.5",
     "vite-plugin-trae-solo-badge": "^1.0.0",
-    "@vue/test-utils": "^2.4.11",
     "happy-dom": "^20.10.6",
     "vitest": "^4.1.10"
   },
